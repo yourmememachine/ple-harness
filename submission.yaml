@@ -1,0 +1,10 @@
+# ple-harness — agent harness for Physical-Engineering's Last Exam.
+# The install step builds an isolated venv under /opt/harness (the only
+# path that survives into the serve container); serve runs from it.
+
+name: ple-harness
+model_api: google-cloud/claude-opus-5-5
+install: >-
+  uv venv --python 3.12 /opt/harness/venv
+  && uv pip install --python /opt/harness/venv/bin/python -r {src}/requirements.txt
+serve: /opt/harness/venv/bin/python {src}/serve.py
