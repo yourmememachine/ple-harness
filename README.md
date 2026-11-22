@@ -24,21 +24,27 @@ organizers' proxy, which serves only the declared model.
 ```
 submission.yaml   name, model_api, install and serve commands
 serve.py          WebSocket server: bind, frame I/O, session handling,
-                  watchdog and cancel handling
+                  watchdog and cancel handling; also hosts the
+                  validating serialiser — the only outbound frame path
 harness.py        the agent loop (Brief -> Execute -> Finalize);
                   socket-free: run_harness(task, emit, workdir, config)
-protocol.py       validating serialiser — the only outbound frame path
 model_client.py   OpenAI-compatible model client (streaming, retries,
                   usage ledger)
 tools.py          tool schemas and dispatch for the model-facing tools
 requirements.txt  pinned dependencies for the install step
 LICENSE           Apache-2.0
-artifacts/        dev-set outputs, produced only by the kit's
-                  eval/run.py; never edited by hand
+THIRD-PARTY.md    third-party dependency notices (name, version,
+                  licence), kept current as dependencies change
+FIX-NOTES.md      notes on an integration fix made during development
 stub_proxy/       local stub model server for development (below)
 tests/            smoke tests (below)
-run_kit_check.sh  runs the kit check against this entry via the stub
+check_secrets.sh  secret scan over tracked files and git history
+run_kit_check.sh  runs the kit check against this entry via the stub,
+                  plus the advisory secret scan
 ```
+
+There is no `artifacts/` directory yet: it is generated later by
+the kit's eval runner (see Notes), not present in this tree.
 
 The install step in `submission.yaml` creates a venv at
 `/opt/harness/venv` (`uv venv --python 3.12`) and installs
@@ -70,7 +76,10 @@ uv pip install --python .venv/bin/python websockets pytest
 `MODEL_PROXY_URL` / `MODEL_PROXY_KEY` for it, runs
 `uv run python -m kit check` from the kit clone
 (`../stage0/ple-repo`), and prints a per-stage PASS/FAIL summary; the
-full output is kept in `kit-check-last.log`. The build, listen, and
+full output is kept in `kit-check-last.log`. It also runs
+`check_secrets.sh` — a scan of the tracked files and the git history
+for credential-shaped strings — as an advisory stage: the result is
+printed as PASS/FAIL but does not change the kit verdict. The build, listen, and
 smoke stages run containers, so they need Docker; without it the run
 stops at the build stage and reports the stages before it.
 
@@ -87,9 +96,10 @@ Google Cloud project with Vertex AI) and point `MODEL_PROXY_URL` /
 
 ## Notes
 
-- `artifacts/` is written only by `uv run python eval/run.py` from
-  the kit, against the declared model. It is never edited by hand,
-  and the harness never reads it at build or run time.
+- `artifacts/` does not exist in this tree yet. It is generated
+  later, only by `uv run python eval/run.py` from the kit, against
+  the declared model. It is never edited by hand, and the harness
+  never reads it at build or run time.
 - No keys belong in this repository or in `submission.yaml`; model
   credentials reach the harness through the environment the evaluator
   sets (`MODEL_BASE_URL`, `MODEL_API_KEY`, `MODEL_NAME`).

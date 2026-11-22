@@ -15,6 +15,11 @@
 # several stages and still not be ready (for example, the entry must
 # sit at the root of its own git repo with everything committed).
 #
+# After the summary, check_secrets.sh runs as an advisory stage: it
+# scans the tracked files and the git history for credential-shaped
+# strings and prints PASS/FAIL, but its result never changes the
+# kit verdict or this script's exit status.
+#
 # Note: the build/listen/smoke stages run containers, so on a machine
 # without Docker the run stops at the build stage. The stages before
 # it (submission.yaml, model, files) still run and are reported.
@@ -65,6 +70,19 @@ CHECK_RC=${PIPESTATUS[0]}
 echo
 echo "=== stage results (from $LOG) ==="
 grep -E '^\[(PASS|FAIL|WARN|SKIP)\]' "$LOG" || echo "(no stage lines found)"
+
+# --- advisory secret scan (never changes the verdict) -------------------
+echo
+echo "=== secret scan (advisory) ==="
+if [ -x "$BUILD_DIR/check_secrets.sh" ]; then
+  if "$BUILD_DIR/check_secrets.sh"; then
+    echo "[PASS] secrets: no credential-shaped strings in tracked files or git history"
+  else
+    echo "[FAIL] secrets: credential-shaped strings found (advisory only; kit verdict unchanged)"
+  fi
+else
+  echo "[SKIP] secrets: check_secrets.sh not found or not executable"
+fi
 echo
 if grep -q "ready to submit" "$LOG"; then
   echo "VERDICT: ready to submit"
