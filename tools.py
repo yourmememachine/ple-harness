@@ -38,6 +38,14 @@ Contracts worth knowing:
   initialised lazily, a dropped session is re-initialised, and a
   mutating call whose response is lost is probed for its effect
   before any retry — and is not retried at all when no probe exists.
+  Servers are discovered before the loop starts (see
+  :meth:`MCPLayer.discover_all`): the advertised catalogue is paged
+  in full, indexed on disk, and every call is validated locally
+  against the advertised schema before it is sent — an unknown tool,
+  a missing required argument, or a wrongly typed argument is
+  refused locally and never reaches the server. A server that fails
+  discovery is quarantined with its reason and its tools are not
+  offered; discovery failure is never fatal to the run.
 """
 
 from __future__ import annotations
@@ -95,6 +103,169 @@ class MCPTransportLost(MCPError):
 
 class MCPSessionExpired(MCPError):
     """The server says the MCP session is gone and must be reopened."""
+
+
+# ---------------------------------------------------------------------
+# MCP catalogue schemas: compilation and argument validation
+# ---------------------------------------------------------------------
+
+MAX_LIST_PAGES = 100
+DEFAULT_MCP_CALL_TIMEOUT_SEC = 300
+
+_SCHEMA_TYPES = ("string", "integer", "number", "boolean", "object",
+                 "array", "null")
+
+
+def _schema_problems(schema: Any, where: str = "schema") -> list[str]:
+    """Structural problems that keep a JSON schema from compiling.
+
+    Only the subset the local validator enforces is checked: known
+    ``type`` values, ``properties`` as a mapping of schemas,
+    ``required`` as a list of names, and ``items`` as a schema.
+    Anything outside that subset is a compile failure, so a tool
+    whose schema uses it is quarantined rather than offered with
+    validation silently weaker than advertised.
+    """
+    if not isinstance(schema, Mapping):
+        return [f"{where}: not an object"]
+    problems: list[str] = []
+    declared = schema.get("type")
+    if declared is not None:
+        types = declared if isinstance(declared, list) else [declared]
+        for one in types:
+            if one not in _SCHEMA_TYPES:
+                problems.append(f"{where}: unknown type {one!r}")
+    properties = schema.get("properties")
+    if properties is not None:
+        if not isinstance(properties, Mapping):
+            problems.append(f"{where}.properties: not an object")
+        else:
+            for name, sub in properties.items():
+                problems.extend(
+                    _schema_problems(sub, f"{where}.properties.{name}"))
+    required = schema.get("required")
+    if required is not None:
+        if not isinstance(required, (list, tuple)) or \
+                not all(isinstance(r, str) for r in required):
+            problems.append(f"{where}.required: not a list of names")
+    items = schema.get("items")
+    if items is not None:
+        problems.extend(_schema_problems(items, f"{where}.items"))
+    return problems
+
+
+def compile_tool_schema(entry: Mapping[str, Any]) -> tuple[bool, str]:
+    """Whether one advertised tool entry can be offered for calls.
+
+    Returns ``(True, "")`` for a compilable entry, else
+    ``(False, reason)``. A tool that fails here is quarantined —
+    excluded from the callable set — without affecting the rest of
+    its server's tools.
+    """
+    name = entry.get("name")
+    if not isinstance(name, str) or not name:
+        return False, "advertised tool has no usable name"
+    schema = entry.get("inputSchema", entry.get("input_schema"))
+    if schema is None:
+        schema = {}
+    if not isinstance(schema, Mapping):
+        return False, f"tool {name}: input schema is not an object"
+    declared = schema.get("type")
+    if declared is not None and declared != "object":
+        return False, f"tool {name}: input schema type is {declared!r}, " \
+                      "not \"object\""
+    problems = _schema_problems(schema)
+    if problems:
+        return False, f"tool {name}: " + "; ".join(problems)
+    return True, ""
+
+
+def _type_matches(declared: Any, value: Any) -> bool:
+    types = declared if isinstance(declared, list) else [declared]
+    for one in types:
+        if one == "string" and isinstance(value, str):
+            return True
+        if one == "integer" and isinstance(value, int) \
+                and not isinstance(value, bool):
+            return True
+        if one == "number" and isinstance(value, (int, float)) \
+                and not isinstance(value, bool):
+            return True
+        if one == "boolean" and isinstance(value, bool):
+            return True
+        if one == "object" and isinstance(value, Mapping):
+            return True
+        if one == "array" and isinstance(value, (list, tuple)):
+            return True
+        if one == "null" and value is None:
+            return True
+    return False
+
+
+def validate_arguments(schema: Mapping[str, Any],
+                       args: Mapping[str, Any],
+                       where: str = "args") -> Optional[str]:
+    """Validate ``args`` against an advertised input schema.
+
+    Returns a refusal string, or None when the arguments conform.
+    Required arguments must be present and every declared property
+    that is present must match its declared type (recursing into
+    nested objects and array items) and its ``enum`` when one is
+    advertised. Undeclared extra arguments are passed through, as
+    servers routinely accept them.
+    """
+    for name in schema.get("required") or []:
+        if name not in args:
+            return f"{where}: missing required argument {name!r}"
+    properties = schema.get("properties") or {}
+    for name, value in args.items():
+        sub = properties.get(name)
+        if not isinstance(sub, Mapping):
+            continue
+        declared = sub.get("type")
+        if declared is not None and not _type_matches(declared, value):
+            return (f"{where}.{name}: expected type {declared!r}, "
+                    f"got {type(value).__name__}")
+        enum = sub.get("enum")
+        if isinstance(enum, (list, tuple)) and value not in enum:
+            return f"{where}.{name}: {value!r} is not one of the " \
+                   "advertised values"
+        if isinstance(value, Mapping) and (
+                sub.get("properties") or sub.get("required")):
+            problem = validate_arguments(sub, value, f"{where}.{name}")
+            if problem:
+                return problem
+        if isinstance(value, (list, tuple)) and \
+                isinstance(sub.get("items"), Mapping):
+            for index, item in enumerate(value):
+                item_type = sub["items"].get("type")
+                if item_type is not None and \
+                        not _type_matches(item_type, item):
+                    return (f"{where}.{name}[{index}]: expected type "
+                            f"{item_type!r}, got {type(item).__name__}")
+    return None
+
+
+def find_tools_schema() -> dict[str, Any]:
+    """OpenAI-style function schema for the catalogue search tool."""
+    return {
+        "type": "function",
+        "function": {
+            "name": "find_tools",
+            "description": "Search the discovered MCP tool catalogue "
+                           "and return matching tools with their "
+                           "schemas. Only tools returned here can be "
+                           "called with mcp_call.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "server": {"type": "string"},
+                },
+                "required": ["query"],
+            },
+        },
+    }
 
 
 def _result(ok: bool, summary: str, data: Any = None,
@@ -270,6 +441,57 @@ class MCPLayer:
         self.mutating_tools = set(cfg.get("mutating_tools") or ())
         self.sessions: dict[str, dict[str, Any]] = {}
         self._ids = 0
+        self._cfg = cfg
+        self.max_list_pages = max(1, int(cfg.get("mcp_max_list_pages",
+                                                 MAX_LIST_PAGES)))
+        try:
+            self.call_timeout_sec = float(cfg.get(
+                "mcp_call_timeout_sec", DEFAULT_MCP_CALL_TIMEOUT_SEC))
+        except (TypeError, ValueError):
+            self.call_timeout_sec = float(DEFAULT_MCP_CALL_TIMEOUT_SEC)
+        # Discovery state: server -> {"status", "tools", "quarantined"}
+        # for servers discovery has visited. Empty until discover_all
+        # (or discover) runs; call validation applies only to servers
+        # present here, so undiscovered use keeps its prior behaviour.
+        self.catalogue: dict[str, dict[str, Any]] = {}
+        self.discovery_recall: dict[str, Any] = {
+            "servers": {},
+            "totals": {"advertised": 0, "indexed": 0, "callable": 0}},
+
+    # -- call timeout ----------------------------------------------------
+
+    def _remaining_call_timeout(
+            self, explicit: Optional[float] = None) -> float:
+        """Seconds one MCP call may still take.
+
+        The bound is the configured per-call cap, tightened by the
+        remaining task time under the same deadline machinery the
+        dispatcher uses for ``exec`` (config ``deadline`` epoch or a
+        ``time_left`` callable, minus a 2 s safety margin). No call
+        may hang past the remaining task time.
+        """
+        budget = self.call_timeout_sec
+        if explicit is not None:
+            try:
+                budget = min(budget, float(explicit))
+            except (TypeError, ValueError):
+                pass
+        remaining: Optional[float] = None
+        deadline = self._cfg.get("deadline")
+        if isinstance(deadline, (int, float)):
+            remaining = float(deadline) - time.time()
+        else:
+            time_left = self._cfg.get("time_left")
+            if callable(time_left):
+                try:
+                    value = time_left()
+                except Exception:
+                    value = None
+                if isinstance(value, (int, float)):
+                    remaining = float(value)
+        if remaining is not None:
+            budget = min(budget, remaining - 2)
+        return budget
 
     # -- plumbing ------------------------------------------------------
 
@@ -304,7 +526,7 @@ class MCPLayer:
             "type": "http", "method": "POST", "url": url, "headers": headers,
             "body_b64": base64.b64encode(
                 json.dumps(payload).encode("utf-8")).decode(),
-            "timeout_sec": 300,
+            "timeout_sec": max(1, int(self._remaining_call_timeout())),
         }
         result = self.http_request(frame)
         if not isinstance(result, Mapping) or not result.get("ok", True):
@@ -409,18 +631,214 @@ class MCPLayer:
             self.initialize(server)
 
     def list_tools(self, server: str) -> list[dict[str, Any]]:
+        """The server's full advertised catalogue, paged completely.
+
+        Pagination is followed to the end; it is never silently
+        truncated. If the server still offers a next page after
+        ``max_list_pages`` pages, that is recorded as a defect — an
+        :class:`MCPError` the discovery path quarantines the server
+        with — rather than a partial catalogue presented as whole.
+        """
         self.ensure_session(server)
         tools: list[dict[str, Any]] = []
         cursor: Optional[str] = None
-        for _ in range(100):
+        for _ in range(self.max_list_pages):
             page = self._rpc(server, "tools/list",
                              {"cursor": cursor} if cursor else {})
             found = page.get("tools") if isinstance(page.get("tools"), list) else []
             tools.extend(t for t in found if isinstance(t, Mapping))
             cursor = page.get("nextCursor")
             if not cursor:
-                break
-        return tools
+                return tools
+        raise MCPError(
+            f"tools/list for {server}: pagination exceeded "
+            f"{self.max_list_pages} pages; the catalogue is incomplete "
+            "and is recorded as a defect, not truncated silently")
+
+    # -- discovery ---------------------------------------------------------
+
+    def discover(self, server: str) -> dict[str, Any]:
+        """Fetch and index one server's catalogue.
+
+        Returns the server's recall entry. A server that cannot be
+        reached or answers with a protocol error is quarantined: the
+        entry records the reason, no tools are offered from it, and
+        discovery of the remaining servers continues — the failure is
+        not fatal to the run.
+        """
+        entry: dict[str, Any] = {
+            "server": server, "status": "ok", "reason": None,
+            "advertised": 0, "indexed": 0, "callable": 0,
+            "quarantined_tools": [], "rejected": []}
+        try:
+            advertised = self.list_tools(server)
+        except Exception as exc:
+            if type(exc).__name__ == "SessionCancelled":
+                raise
+            reason = f"{type(exc).__name__}: {exc}"
+            entry["status"] = "quarantined"
+            entry["reason"] = reason
+            self.catalogue[server] = {
+                "status": "quarantined", "reason": reason,
+                "tools": {}, "quarantined": []}
+            return entry
+        entry["advertised"] = len(advertised)
+        tools: dict[str, dict[str, Any]] = {}
+        quarantined: list[dict[str, Any]] = []
+        for raw in advertised:
+            name = raw.get("name")
+            if not isinstance(name, str) or not name:
+                entry["rejected"].append("<unnamed>")
+                continue
+            schema = raw.get("inputSchema", raw.get("input_schema"))
+            record = {
+                "name": name,
+                "description": str(raw.get("description") or ""),
+                "input_schema": dict(schema) if isinstance(schema, Mapping)
+                else schema,
+            }
+            ok, why = compile_tool_schema(raw)
+            if ok:
+                tools[name] = record
+            else:
+                quarantined.append({"name": name, "reason": why})
+                entry["quarantined_tools"].append(name)
+        entry["indexed"] = len(tools) + len(quarantined)
+        entry["callable"] = len(tools)
+        self.catalogue[server] = {
+            "status": "ok", "reason": None,
+            "tools": tools, "quarantined": quarantined}
+        return entry
+
+    def discover_all(self, index_path: Any = None) -> dict[str, Any]:
+        """Discover every configured server and index the catalogue.
+
+        The index is written atomically to ``index_path`` when one is
+        given (a temporary sibling file, fsynced and renamed over the
+        target), so a reader never sees a partial catalogue. Returns
+        the discovery-recall block: per-server counts of advertised
+        vs indexed vs callable tools, plus totals. These counts
+        measure discovery and transport only; whether the discovered
+        tools then succeed at the task is recorded separately, in the
+        ledger's action entries.
+        """
+        servers: dict[str, Any] = {}
+        totals = {"advertised": 0, "indexed": 0, "callable": 0}
+        for server in list(self.servers):
+            entry = self.discover(server)
+            servers[server] = entry
+            for key in totals:
+                totals[key] += int(entry.get(key, 0))
+        recall = {"servers": servers, "totals": totals}
+        self.discovery_recall = recall
+        if index_path is not None:
+            index: dict[str, Any] = {"servers": {}, "totals": totals}
+            for server, entry in servers.items():
+                cat = self.catalogue.get(server) or {}
+                index["servers"][server] = {
+                    "status": entry["status"],
+                    "reason": entry["reason"],
+                    "tools": [cat["tools"][name]
+                              for name in sorted(cat.get("tools") or {})],
+                    "quarantined_tools": cat.get("quarantined") or [],
+                    "rejected": entry["rejected"],
+                }
+            path = Path(index_path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(
+                f"{path.name}.{os.getpid()}.{os.urandom(6).hex()}.tmp")
+            with open(tmp, "wb") as handle:
+                handle.write(json.dumps(index, indent=1, sort_keys=True,
+                                        ensure_ascii=False).encode("utf-8"))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, path)
+        return recall
+
+    def find_tools(self, query: str, server: Optional[str] = None,
+                   limit: int = 10) -> list[dict[str, Any]]:
+        """Ranked candidate tools from the discovered catalogue.
+
+        Matches query tokens against tool names (weighted double) and
+        descriptions; only callable tools are returned — quarantined
+        servers and quarantined tools are never offered. An empty
+        query returns the callable catalogue in name order, bounded
+        by ``limit``.
+        """
+        tokens = [t for t in re.split(r"[^a-z0-9]+", str(query).lower()) if t]
+        scored: list[tuple[int, str, str, dict[str, Any]]] = []
+        for name, cat in self.catalogue.items():
+            if server is not None and name != server:
+                continue
+            if cat.get("status") != "ok":
+                continue
+            for tool_name, record in (cat.get("tools") or {}).items():
+                if not tokens:
+                    score = 1
+                else:
+                    hay_name = tool_name.lower()
+                    hay_desc = str(record.get("description") or "").lower()
+                    score = sum(2 for t in tokens if t in hay_name) \
+                        + sum(1 for t in tokens if t in hay_desc)
+                if score > 0:
+                    scored.append((score, name, tool_name, {
+                        "server": name, "name": tool_name,
+                        "description": record.get("description", ""),
+                        "input_schema": record.get("input_schema") or {},
+                    }))
+        scored.sort(key=lambda item: (-item[0], item[1], item[2]))
+        return [item[3] for item in scored[:max(0, int(limit))]]
+
+    def catalogue_context_lines(self) -> list[str]:
+        """Names-and-one-line-descriptions index for loop context."""
+        lines: list[str] = []
+        for server in sorted(self.catalogue):
+            cat = self.catalogue[server]
+            if cat.get("status") != "ok":
+                lines.append(
+                    f"{server}: unavailable (quarantined: "
+                    f"{cat.get('reason')})")
+                continue
+            for name in sorted(cat.get("tools") or {}):
+                record = cat["tools"][name]
+                desc = str(record.get("description") or "").splitlines()
+                lines.append(f"{server}/{name}: "
+                             f"{desc[0] if desc else ''}".rstrip())
+            for item in cat.get("quarantined") or []:
+                lines.append(f"{server}/{item['name']}: unavailable "
+                             f"(quarantined: {item['reason']})")
+        return lines
+
+    def validate_call(self, server: str, tool: str,
+                      args: Mapping[str, Any]) -> Optional[str]:
+        """Local refusal reason for a proposed call, or None to send.
+
+        Applies only once the server has been discovered: an
+        undiscovered server keeps the layer's prior behaviour. A
+        discovered server refuses, before anything is sent, a call
+        to a quarantined server, an unknown or quarantined tool, or
+        arguments that miss a required field or mistype a declared
+        one.
+        """
+        cat = self.catalogue.get(server)
+        if cat is None:
+            return None
+        if cat.get("status") != "ok":
+            return (f"server {server} is quarantined "
+                    f"({cat.get('reason')}); its tools are not offered")
+        tools = cat.get("tools") or {}
+        if tool not in tools:
+            for item in cat.get("quarantined") or []:
+                if item.get("name") == tool:
+                    return (f"tool {tool} on {server} is quarantined "
+                            f"({item['reason']}); it is not offered")
+            return (f"unknown tool {tool!r} on server {server}: not in "
+                    "the discovered catalogue")
+        schema = tools[tool].get("input_schema")
+        if isinstance(schema, Mapping):
+            return validate_arguments(schema, args,
+                                      where=f"{server}/{tool} args")
+        return None
 
     # -- calls -----------------------------------------------------------
 
@@ -462,7 +880,39 @@ class MCPLayer:
 
     def call(self, server: str, tool: str,
              args: Optional[Mapping[str, Any]] = None,
-             mutating: Optional[bool] = None) -> dict[str, Any]:
+             mutating: Optional[bool] = None,
+             timeout_sec: Optional[float] = None) -> dict[str, Any]:
+        """Call one MCP tool, validated locally and time-bounded.
+
+        Once the server has been discovered, the call is validated
+        against the advertised schema first: an unknown tool, a
+        missing required argument, or a wrongly typed argument is
+        refused locally and never sent. The call is bounded by the
+        per-call timeout (the configured cap tightened by the
+        remaining task time): with no time remaining the call is
+        refused before sending, and a call that returns after its
+        bound is reported as a timeout rather than trusted.
+        """
+        arguments = dict(args or {})
+        refusal = self.validate_call(server, tool, arguments)
+        if refusal is not None:
+            raise MCPError(f"mcp_call refused locally: {refusal}")
+        budget = self._remaining_call_timeout(timeout_sec)
+        if budget <= 0:
+            raise MCPError(
+                f"tools/call {tool}: no task time remaining; not sent")
+        started = time.monotonic()
+        result = self._call_recovering(server, tool, arguments,
+                                       mutating=mutating)
+        if time.monotonic() - started > budget:
+            raise MCPError(
+                f"tools/call {tool}: exceeded the per-call timeout "
+                f"of {budget:.1f}s")
+        return result
+
+    def _call_recovering(self, server: str, tool: str,
+                         args: Optional[Mapping[str, Any]] = None,
+                         mutating: Optional[bool] = None) -> dict[str, Any]:
         """Call one MCP tool, with session recovery and safe retries.
 
         A lost response to a mutating call is probed before any

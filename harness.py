@@ -49,7 +49,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from model_client import (ModelClient, ModelCallInterrupted,  # noqa: E402
                           fingerprint_call, normalize_usage, total_tokens)
-from tools import ToolDispatcher, tool_schemas  # noqa: E402
+from tools import ToolDispatcher, find_tools_schema, tool_schemas  # noqa: E402
 
 SUMMARY_CAP_BYTES = 64 * 1024
 EARLY_DELIVERABLE_FRACTION = 0.20
@@ -223,6 +223,7 @@ SUMMARY_FIELDS = (
     "usage_defects", "deliverables", "constraints", "work_items",
     "checks", "decisions", "dead_ends", "recent_actions",
     "dropped_actions", "dropped_entries", "all_hard_checks_pass",
+    "duplicate_events", "background_stopped",
     "updated_seq",
 )
 
@@ -251,6 +252,8 @@ def _empty_summary(task_id: str) -> dict[str, Any]:
         "dropped_actions": 0,
         "dropped_entries": 0,
         "all_hard_checks_pass": False,
+        "duplicate_events": 0,
+        "background_stopped": 0,
         "updated_seq": 0,
     }
 
@@ -356,12 +359,21 @@ class LedgerState:
         self.summary_path = self.dir / "summary.json"
         self.seq = 0
         self.summary: dict[str, Any] = _empty_summary(task_id)
+        # Sequence numbers this fold has already applied (the
+        # duplicate guard) and the defect record of the most recent
+        # rebuild: how many ledger lines were torn and how many
+        # events were skipped as duplicates.
+        self._applied_seqs: set[int] = set()
+        self.rebuild_defects: dict[str, int] = {
+            "torn_lines": 0, "duplicate_events": 0}
         if self.summary_path.exists():
             try:
                 loaded = json.loads(self.summary_path.read_text("utf-8"))
                 if isinstance(loaded, dict) and loaded.get("task_id") == task_id:
                     self.summary = loaded
                     self.seq = int(loaded.get("updated_seq", 0))
+                    for key in ("duplicate_events", "background_stopped"):
+                        self.summary.setdefault(key, 0)
             except (ValueError, OSError):
                 pass
 
@@ -385,9 +397,24 @@ class LedgerState:
             usage={k: int(record.get(k, 0)) for k in self.summary["usage"]},
             defects=[str(d) for d in (record.get("defects") or [])])
 
-    def _fold(self, event: Mapping[str, Any]) -> None:
-        kind = event.get("kind")
+    def _fold(self, event: Mapping[str, Any]) -> bool:
+        """Fold one event into the summary; False when it is skipped.
+
+        An event carrying a sequence number is applied at most once:
+        a replayed sequence is counted in ``duplicate_events`` and
+        skipped, so replaying part of the ledger cannot double-count
+        the record. Events without a sequence number (written before
+        appends assigned sequences) always apply, in order.
+        """
         summary = self.summary
+        seq = event.get("seq")
+        if isinstance(seq, int) and not isinstance(seq, bool):
+            if seq in self._applied_seqs:
+                summary["duplicate_events"] = int(
+                    summary.get("duplicate_events", 0)) + 1
+                return False
+            self._applied_seqs.add(seq)
+        kind = event.get("kind")
         if kind == "usage":
             usage = event.get("usage") or {}
             for key in summary["usage"]:
@@ -443,6 +470,11 @@ class LedgerState:
             summary["decisions"].append(str(event.get("text", ""))[:500])
         elif kind == "dead_end":
             summary["dead_ends"].append(str(event.get("text", ""))[:500])
+        elif kind == "background_stop":
+            summary["background_stopped"] = int(
+                summary.get("background_stopped", 0)) + int(
+                    event.get("stopped") or 0)
+        return True
 
     def rebuild_summary(self) -> dict[str, Any]:
         """Regenerate the summary from the ledger alone.
@@ -451,20 +483,50 @@ class LedgerState:
         seeded from the in-memory summary — and the result passes
         through the same compaction as :meth:`persist`, so a rebuild
         of an uncompacted fold equals the persisted summary exactly.
+
+        Recovery never raises on file content. Each line is parsed
+        on its own: a malformed line — above all the torn final
+        line a crash mid-append leaves behind — is skipped, the
+        well-formed lines before and after it still fold, and the
+        skip is recorded in :attr:`rebuild_defects` (the count of
+        torn lines, alongside the duplicate count the fold itself
+        records in the summary). Replayed events are applied at
+        most once, by sequence number (see :meth:`_fold`).
         """
         fresh = LedgerState.__new__(LedgerState)
         fresh.dir, fresh.task_id = self.dir, self.task_id
         fresh.ledger_path, fresh.summary_path = self.ledger_path, self.summary_path
         fresh.seq = 0
         fresh.summary = _empty_summary(self.task_id)
+        fresh._applied_seqs = set()
+        fresh.rebuild_defects = {"torn_lines": 0, "duplicate_events": 0}
+        torn = 0
         if self.ledger_path.exists():
-            for line in self.ledger_path.read_text("utf-8").splitlines():
+            try:
+                text = self.ledger_path.read_bytes().decode(
+                    "utf-8", errors="replace")
+            except OSError:
+                text = ""
+            for line in text.splitlines():
                 if not line.strip():
                     continue
-                event = json.loads(line)
-                fresh.seq = int(event.get("seq", fresh.seq))
-                fresh._fold(event)
+                try:
+                    event = json.loads(line)
+                    if not isinstance(event, dict):
+                        raise ValueError(
+                            "ledger line is not a JSON object")
+                    seq = event.get("seq")
+                    if isinstance(seq, int) and not isinstance(seq, bool):
+                        fresh.seq = max(fresh.seq, seq)
+                    fresh._fold(event)
+                except Exception:
+                    torn += 1
+                    continue
                 fresh.summary["updated_seq"] = fresh.seq
+        self.rebuild_defects = {
+            "torn_lines": torn,
+            "duplicate_events": int(
+                fresh.summary.get("duplicate_events", 0))}
         return _compact_summary_dict(fresh.summary)
 
     # -- compaction ------------------------------------------------------
@@ -1100,6 +1162,26 @@ def run_harness(task: Any, emit: Optional[Callable[[dict[str, Any]], Any]],
                 "the protected reserve")
         return response
 
+    def finish_background() -> int:
+        """Stop every background job this run started; never raises.
+
+        Called on every exit path out of the loop, before the
+        closing summary is finalised, so no job outlives the run
+        and the summary records how many were stopped. A failure
+        inside the stop is swallowed: it must never mask the run's
+        own outcome.
+        """
+        try:
+            stopped = int(tools.stop_all_background())
+        except Exception:
+            return 0
+        if stopped:
+            try:
+                state.append_event("background_stop", stopped=stopped)
+            except Exception:
+                pass
+        return stopped
+
     outcome: dict[str, Any] = {"task_id": task_id, "status": "started",
                                "terminal_frame_sent": False}
     try:
@@ -1108,6 +1190,39 @@ def run_harness(task: Any, emit: Optional[Callable[[dict[str, Any]], Any]],
         if inventory is None:
             inventory = _inventory(root, tools)
         state.append_event("phase", phase="brief")
+
+        # ---- MCP discovery (Brief time, no model call) ----
+        # Each named server's catalogue is paged in full and indexed
+        # on disk in the task state dir; a server that fails
+        # discovery is quarantined with its reason and its tools are
+        # not offered. Recall counts (advertised vs indexed vs
+        # callable) are recorded in the ledger and the outcome,
+        # separately from whether the tools then succeed at calls.
+        discovery_recall: dict[str, Any] = {
+            "servers": {},
+            "totals": {"advertised": 0, "indexed": 0, "callable": 0}}
+        catalogue_lines: list[str] = []
+        if tools.mcp.servers:
+            try:
+                discovery_recall = tools.mcp.discover_all(
+                    state_dir / "mcp_catalogue.json")
+                catalogue_lines = tools.mcp.catalogue_context_lines()
+            except Exception as exc:
+                if _is_session_cancelled(exc):
+                    raise
+                state.append_event(
+                    "dead_end", text=f"MCP discovery failed: {exc}")
+            for server, entry in (discovery_recall.get("servers")
+                                  or {}).items():
+                state.append_event(
+                    "mcp_discovery", server=server,
+                    status=entry.get("status"),
+                    reason=entry.get("reason"),
+                    advertised=entry.get("advertised"),
+                    indexed=entry.get("indexed"),
+                    callable=entry.get("callable"),
+                    quarantined_tools=entry.get("quarantined_tools"))
+        outcome["discovery_recall"] = discovery_recall
 
         # ---- Brief ----
         brief_raw: dict[str, Any] = {}
@@ -1119,7 +1234,11 @@ def run_harness(task: Any, emit: Optional[Callable[[dict[str, Any]], Any]],
              "with text, hard true/false, a source_span quoting the "
              "instruction span each came from, and a check), work_items, "
              "and unknowns.\n\nInstruction:\n" + instruction
-             + "\n\nInventory:\n" + json.dumps(inventory, default=str)[:6000]},
+             + "\n\nInventory:\n" + json.dumps(inventory, default=str)[:6000]
+             + ("\n\nMCP tool catalogue (names and descriptions; use "
+                "find_tools during Execute to get a tool's schema "
+                "before calling it):\n" + "\n".join(catalogue_lines)
+                if catalogue_lines else "")},
         ]
         try:
             reply = call_model("brief", brief_messages)
@@ -1133,6 +1252,7 @@ def run_harness(task: Any, emit: Optional[Callable[[dict[str, Any]], Any]],
         except BudgetExceeded:
             brief_raw = {}
         brief = normalise_brief(brief_raw, task)
+        brief["mcp_catalogue"] = catalogue_lines
         _atomic_write_json(state_dir / "brief.json", brief)
         for constraint in brief["constraints"]:
             state.append_event(
@@ -1214,8 +1334,11 @@ def run_harness(task: Any, emit: Optional[Callable[[dict[str, Any]], Any]],
             hashes_before = _deliverable_hashes(store, brief)
             messages = _execute_messages(state, brief, observations,
                                          governor)
+            tool_defs = tool_schemas()
+            if catalogue_lines:
+                tool_defs = tool_defs + [find_tools_schema()]
             try:
-                reply = call_model("execute", messages, tool_schemas())
+                reply = call_model("execute", messages, tool_defs)
             except BudgetExceeded:
                 break
             content = getattr(reply, "content", "") or ""
@@ -1252,7 +1375,17 @@ def run_harness(task: Any, emit: Optional[Callable[[dict[str, Any]], Any]],
                         result_class="blocked",
                         detail="repeat guard: blocked before dispatch")
                     continue
-                result = tools.dispatch(name, args)
+                if name == "find_tools":
+                    found = tools.mcp.find_tools(
+                        str(args.get("query") or ""),
+                        server=args.get("server"))
+                    result = {
+                        "ok": True,
+                        "summary": f"find_tools: {len(found)} candidate "
+                                   "tool(s)",
+                        "data": found}
+                else:
+                    result = tools.dispatch(name, args)
                 result_class = ("ok" if result.get("ok") else
                                 str(result.get("error_class") or "error"))
                 blob = json.dumps(result, default=str, sort_keys=True)
@@ -1383,6 +1516,7 @@ def run_harness(task: Any, emit: Optional[Callable[[dict[str, Any]], Any]],
                              "deliverable's own checks (sha256 "
                              f"{hashlib.sha256(current or b'').hexdigest()[:12]})")
                     store.restore_verified(path)
+        finish_background()
         state.persist()
         outcome.update({
             "status": "finalized",
@@ -1403,7 +1537,18 @@ def run_harness(task: Any, emit: Optional[Callable[[dict[str, Any]], Any]],
         return outcome
     except Exception as exc:  # the supervisor owns the closing frame
         if _is_session_cancelled(exc):
+            # The run is being torn down by the session layer, but
+            # its background jobs are still stopped and the stop is
+            # recorded in the persisted summary before the
+            # cancellation propagates; none of this may mask it.
+            finish_background()
+            try:
+                state.persist()
+            except Exception:
+                pass
+            _write_closing_summary(state, state_dir)
             raise
+        finish_background()
         state.append_event("dead_end",
                            text=f"loop failure: {type(exc).__name__}: {exc}")
         try:
@@ -1477,7 +1622,8 @@ def _execute_messages(state: LedgerState, brief: Mapping[str, Any],
     context = {
         "brief": {"deliverables": brief["deliverables"],
                   "constraints": brief["constraints"],
-                  "work_items": brief["work_items"]},
+                  "work_items": brief["work_items"],
+                  "mcp_catalogue": brief.get("mcp_catalogue") or []},
         "summary": {k: summary[k] for k in
                     ("phase", "turn_count", "deliverables", "checks",
                      "all_hard_checks_pass")},
