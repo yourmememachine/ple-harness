@@ -252,7 +252,7 @@ def test_call_that_overruns_its_timeout_is_reported():
 
 def test_call_refused_when_no_task_time_remains():
     layer = MCPLayer({"s": "http://x"}, transport=StubMCPTransport(),
-                     config={"deadline": time.time() - 5})
+                     config={"deadline": time.monotonic() - 5})
     with pytest.raises(MCPError, match="no task time remaining"):
         layer.call("s", "get_record", {})
 

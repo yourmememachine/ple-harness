@@ -481,12 +481,15 @@ def test_read_file_bounded(tmp_path):
 # ---------------------------------------------------------------------
 
 def test_exec_clamped_to_remaining_task_time(tmp_path):
+    # The deadline contract is monotonic (serve.py supplies a
+    # time.monotonic() timestamp); updated from the old wall-clock
+    # form when the tools layer adopted that contract.
     dispatcher = ToolDispatcher(
-        tmp_path, config={"deadline": time.time() + 4})
-    start = time.time()
+        tmp_path, config={"deadline": time.monotonic() + 4})
+    start = time.monotonic()
     result = dispatcher.dispatch(
         "exec", {"command": "sleep 30", "timeout_s": 600})
-    elapsed = time.time() - start
+    elapsed = time.monotonic() - start
     assert result["ok"] is True
     assert result["data"]["timed_out"] is True
     assert elapsed < 10  # clamped to ~2 s of remaining time, not 30/600
@@ -494,6 +497,6 @@ def test_exec_clamped_to_remaining_task_time(tmp_path):
 
 def test_exec_with_expired_deadline_refused(tmp_path):
     dispatcher = ToolDispatcher(
-        tmp_path, config={"deadline": time.time() - 1})
+        tmp_path, config={"deadline": time.monotonic() - 1})
     result = dispatcher.dispatch("exec", {"command": "true"})
     assert result["ok"] is False

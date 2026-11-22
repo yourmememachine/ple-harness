@@ -232,6 +232,13 @@ SUMMARY_FIELDS = (
 # can push the summary past its cap on its own.
 FOLD_TEXT_CHARS = 240
 
+# Usage defects are bounded the same way: at most this many entries
+# are kept in the summary, each truncated to FOLD_TEXT_CHARS with an
+# explicit marker; anything past the bound is counted in
+# ``dropped_entries`` instead of being recorded.
+MAX_USAGE_DEFECTS = 50
+DEFECT_TRUNCATED_SUFFIX = "…[truncated]"
+
 
 def _empty_summary(task_id: str) -> dict[str, Any]:
     return {
@@ -284,6 +291,21 @@ def _compact_summary_dict(summary: dict[str, Any],
     summary = copy.deepcopy(summary)
     summary["dropped_actions"] = int(summary.get("dropped_actions", 0))
     summary["dropped_entries"] = int(summary.get("dropped_entries", 0))
+
+    # Usage defects are bounded before anything else is measured:
+    # each entry truncated, the list capped, the excess counted.
+    # The fold applies the same bounds, so this step only bites on a
+    # summary that was built or loaded without them.
+    defects = summary.get("usage_defects")
+    if isinstance(defects, list) and defects:
+        bounded = []
+        for defect in defects[:MAX_USAGE_DEFECTS]:
+            text = str(defect)
+            if len(text) > FOLD_TEXT_CHARS:
+                text = text[:FOLD_TEXT_CHARS] + DEFECT_TRUNCATED_SUFFIX
+            bounded.append(text)
+        summary["dropped_entries"] += len(defects) - len(bounded)
+        summary["usage_defects"] = bounded
 
     def size() -> int:
         return len(json.dumps(summary, ensure_ascii=False,
@@ -342,6 +364,63 @@ def _compact_summary_dict(summary: dict[str, Any],
     return summary
 
 
+_LEDGER_KINDS = frozenset({
+    "usage", "turn", "phase", "action", "deliverable", "constraint",
+    "work_item", "checks", "decision", "dead_end", "background_stop",
+    "mcp_discovery",
+})
+
+_USAGE_COUNT_KEYS = ("input_tokens", "output_tokens",
+                     "cache_read_tokens", "cache_write_tokens")
+
+
+def _int_coercible(value: Any) -> bool:
+    try:
+        int(value)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def _ledger_event_error(event: Any) -> Optional[str]:
+    """Why a ledger line cannot be folded, or None when it can.
+
+    Rebuild and crash recovery validate before folding: a line that
+    parses as JSON but is semantically wrong — an unknown kind, a
+    wrong-typed numeric field — must be rejected whole. Folding it
+    until the bad field raises would leave a half-applied event in
+    the summary (the valid fields already added, the event counted
+    as torn).
+    """
+    if not isinstance(event, dict):
+        return "ledger line is not a JSON object"
+    kind = event.get("kind")
+    if kind not in _LEDGER_KINDS:
+        return f"unknown ledger event kind: {kind!r}"
+    seq = event.get("seq")
+    if seq is not None and (not isinstance(seq, int)
+                            or isinstance(seq, bool)):
+        return "ledger event seq is not an integer"
+    if kind == "usage":
+        usage = event.get("usage")
+        if usage is not None:
+            if not isinstance(usage, Mapping):
+                return "usage event carries no usage object"
+            for key in _USAGE_COUNT_KEYS:
+                if key in usage and not _int_coercible(usage[key]):
+                    return f"usage count {key} is not a number"
+        defects = event.get("defects")
+        if defects is not None and not isinstance(defects, (list, tuple)):
+            return "usage defects are not a list"
+    elif kind == "turn":
+        if "turn" in event and not _int_coercible(event["turn"]):
+            return "turn count is not a number"
+    elif kind == "background_stop":
+        if "stopped" in event and not _int_coercible(event["stopped"]):
+            return "background stop count is not a number"
+    return None
+
+
 class LedgerState:
     """Append-only ledger plus the summary generated from it.
 
@@ -366,16 +445,75 @@ class LedgerState:
         self._applied_seqs: set[int] = set()
         self.rebuild_defects: dict[str, int] = {
             "torn_lines": 0, "duplicate_events": 0}
+        summary_loaded = False
+        foreign_summary = False
         if self.summary_path.exists():
             try:
                 loaded = json.loads(self.summary_path.read_text("utf-8"))
-                if isinstance(loaded, dict) and loaded.get("task_id") == task_id:
+                if isinstance(loaded, dict) and \
+                        loaded.get("task_id") == task_id:
+                    loaded_seq = int(loaded.get("updated_seq", 0))
                     self.summary = loaded
-                    self.seq = int(loaded.get("updated_seq", 0))
+                    self.seq = loaded_seq
                     for key in ("duplicate_events", "background_stopped"):
                         self.summary.setdefault(key, 0)
+                    summary_loaded = True
+                elif isinstance(loaded, dict):
+                    # The summary on disk belongs to another task:
+                    # this state dir is not this task's to recover.
+                    foreign_summary = True
             except (ValueError, OSError):
                 pass
+        if not foreign_summary:
+            self._recover_ledger_tail(summary_loaded)
+
+    def _recover_ledger_tail(self, summary_loaded: bool) -> None:
+        """Fold ledger events the persisted summary never saw.
+
+        Appends land in the ledger immediately; the summary persists
+        later. A crash inside that window leaves events in the
+        ledger that the resumed summary does not reflect — and if
+        the next sequence were seeded from the stale summary alone,
+        the resumed state would re-issue sequence numbers already
+        present in the ledger, and a later rebuild would drop the
+        new events as duplicates. Recovery scans the ledger
+        (tolerating torn and invalid lines), folds every well-formed
+        event past the persisted summary's position — or the whole
+        ledger when no usable summary exists — and seeds the next
+        sequence from the highest sequence actually present.
+        """
+        if not self.ledger_path.exists():
+            return
+        try:
+            text = self.ledger_path.read_bytes().decode(
+                "utf-8", errors="replace")
+        except OSError:
+            return
+        base_seq = self.seq if summary_loaded else 0
+        seen: set[int] = set()
+        for line in text.splitlines():
+            if not line.strip():
+                continue
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            if _ledger_event_error(event) is not None:
+                continue
+            seq = event.get("seq")
+            seq = seq if isinstance(seq, int) and \
+                not isinstance(seq, bool) else None
+            if seq is not None:
+                seen.add(seq)
+            if summary_loaded:
+                if seq is not None and seq > base_seq:
+                    self._fold(event)
+            else:
+                self._fold(event)
+        if seen:
+            self._applied_seqs |= seen
+            self.seq = max(self.seq, max(seen))
+            self.summary["updated_seq"] = self.seq
 
     # -- ledger ------------------------------------------------------
 
@@ -422,8 +560,14 @@ class LedgerState:
             summary["model_calls"] += 1
             defects = summary.setdefault("usage_defects", [])
             for defect in event.get("defects") or []:
-                if len(defects) < 50:
-                    defects.append(str(defect))
+                text = str(defect)
+                if len(text) > FOLD_TEXT_CHARS:
+                    text = text[:FOLD_TEXT_CHARS] + DEFECT_TRUNCATED_SUFFIX
+                if len(defects) < MAX_USAGE_DEFECTS:
+                    defects.append(text)
+                else:
+                    summary["dropped_entries"] = int(
+                        summary.get("dropped_entries", 0)) + 1
         elif kind == "turn":
             summary["turn_count"] = int(event.get("turn", summary["turn_count"]))
         elif kind == "phase":
@@ -490,8 +634,12 @@ class LedgerState:
         well-formed lines before and after it still fold, and the
         skip is recorded in :attr:`rebuild_defects` (the count of
         torn lines, alongside the duplicate count the fold itself
-        records in the summary). Replayed events are applied at
-        most once, by sequence number (see :meth:`_fold`).
+        records in the summary). A line that parses but fails field
+        validation (see :func:`_ledger_event_error`) is counted
+        torn and not folded at all, so a half-valid event cannot
+        leave phantom counts in the rebuilt summary. Replayed
+        events are applied at most once, by sequence number (see
+        :meth:`_fold`).
         """
         fresh = LedgerState.__new__(LedgerState)
         fresh.dir, fresh.task_id = self.dir, self.task_id
@@ -512,16 +660,16 @@ class LedgerState:
                     continue
                 try:
                     event = json.loads(line)
-                    if not isinstance(event, dict):
-                        raise ValueError(
-                            "ledger line is not a JSON object")
-                    seq = event.get("seq")
-                    if isinstance(seq, int) and not isinstance(seq, bool):
-                        fresh.seq = max(fresh.seq, seq)
-                    fresh._fold(event)
-                except Exception:
+                except ValueError:
                     torn += 1
                     continue
+                if _ledger_event_error(event) is not None:
+                    torn += 1
+                    continue
+                seq = event.get("seq")
+                fresh._fold(event)
+                if isinstance(seq, int) and not isinstance(seq, bool):
+                    fresh.seq = max(fresh.seq, seq)
                 fresh.summary["updated_seq"] = fresh.seq
         self.rebuild_defects = {
             "torn_lines": torn,
@@ -838,13 +986,29 @@ class Verifier:
                 "constraint", id=cid, status=status,
                 hard=bool(constraint.get("hard")),
                 source_span=constraint.get("source_span"))
+        seen_item_ids: dict[str, int] = {}
         for item in brief.get("consistency_items") or []:
+            iid = str(item.get("id")) if isinstance(item, Mapping) \
+                else str(item)
+            if iid in seen_item_ids:
+                # The same duplicate treatment as constraints above:
+                # a repeated id is recorded under its own key as
+                # UNRESOLVED, never collapsed into the first entry —
+                # collapsing would let a later PASS hide an earlier
+                # FAIL behind the one shared id, and both all-pass
+                # gating functions read this section.
+                seen_item_ids[iid] += 1
+                checks["consistency"][f"{iid}#dup{seen_item_ids[iid]}"] = {
+                    "status": "UNRESOLVED",
+                    "evidence": "duplicate consistency item id rejected"}
+                continue
+            seen_item_ids[iid] = 0
             spec = item.get("check") if isinstance(item, Mapping) else None
             if isinstance(spec, Mapping):
                 status, evidence = self.run_check(spec)
             else:
                 status, evidence = "UNRESOLVED", "no check defined"
-            checks["consistency"][str(item.get("id"))] = {
+            checks["consistency"][iid] = {
                 "status": status, "evidence": evidence}
         checks["hard_failure_count"] = sum(
             1 for entry in checks["constraints"].values()
@@ -1516,6 +1680,38 @@ def run_harness(task: Any, emit: Optional[Callable[[dict[str, Any]], Any]],
                              "deliverable's own checks (sha256 "
                              f"{hashlib.sha256(current or b'').hexdigest()[:12]})")
                     store.restore_verified(path)
+            elif not exists:
+                verified = store.verified_copy(path)
+                if verified is not None:
+                    # The graded file is gone — deleted during
+                    # Execute — but a verified copy survives: restore
+                    # it so the graded tree ends the run holding the
+                    # verified bytes, then re-check the path. If the
+                    # restore does not land, the deliverable is
+                    # recorded as not verified, whatever the record
+                    # said before.
+                    state.append_event(
+                        "decision",
+                        text=f"restored {path} from the last verified "
+                             "copy; the graded file was missing at "
+                             "Finalize")
+                    restored = False
+                    try:
+                        restored = store.restore_verified(path)
+                    except Exception as exc:
+                        if _is_session_cancelled(exc):
+                            raise
+                        restored = False
+                    after = store.read_graded(path) if restored else None
+                    if after is not None and hashlib.sha256(
+                            after).hexdigest() == hashlib.sha256(
+                            verified).hexdigest():
+                        checks["deliverables"][path] = {"exists": True}
+                    else:
+                        state.append_event(
+                            "deliverable", path=path,
+                            status="missing" if after is None
+                            else "unverified")
         finish_background()
         state.persist()
         outcome.update({

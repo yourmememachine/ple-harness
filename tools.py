@@ -33,7 +33,11 @@ Contracts worth knowing:
   its own new process group (``setsid``), its output goes to a log
   file, finished jobs are reaped, and jobs are stopped by signalling
   their process group (SIGTERM, then SIGKILL), never by guessing at
-  individual process ids.
+  individual process ids. Jobs started through the evaluator
+  transport are registered by the pid their start reply carries and
+  stopped the same way, via a kill frame; a stop whose effect cannot
+  be confirmed leaves the pid in the dispatcher's
+  ``unreconciled_background`` registry rather than claiming success.
 - ``mcp_call`` goes through the MCP layer in this module: sessions are
   initialised lazily, a dropped session is re-initialised, and a
   mutating call whose response is lost is probed for its effect
@@ -45,7 +49,13 @@ Contracts worth knowing:
   a missing required argument, or a wrongly typed argument is
   refused locally and never reaches the server. A server that fails
   discovery is quarantined with its reason and its tools are not
-  offered; discovery failure is never fatal to the run.
+  offered; discovery failure is never fatal to the run. Server
+  annotations are carried into the catalogue and feed the mutating
+  classification (a ``readOnlyHint`` is the server's own read-only
+  declaration; its absence is not one). A mutating call that returns
+  after its time bound is treated like a lost response — probed, else
+  reported ambiguous — never as a plain timeout a caller might retry
+  into a second application.
 """
 
 from __future__ import annotations
@@ -78,7 +88,23 @@ _MUTATING_HINTS = ("create", "update", "delete", "write", "send", "set",
                    "archive", "rename", "transfer", "apply", "pay",
                    "close", "execute", "duplicate", "destroy", "drop",
                    "edit", "modify", "upload", "import", "replace",
-                   "merge", "cancel", "refund", "charge", "book")
+                   "merge", "cancel", "refund", "charge", "book",
+                   "place", "commit", "reserve", "run", "sign", "reject")
+
+_READONLY_NAME_VERBS = ("get", "list", "read", "fetch", "search",
+                        "query", "describe", "show", "view", "find",
+                        "lookup", "retrieve", "inspect", "check",
+                        "count", "load")
+
+
+def _clearly_readonly(tool: str) -> bool:
+    """Whether a tool name is unmistakably a read: a leading read
+    verb and no mutating hint anywhere in the name."""
+    tokens = [t for t in re.split(r"[^a-z0-9]+", tool.lower()) if t]
+    if not tokens or tokens[0] not in _READONLY_NAME_VERBS:
+        return False
+    lowered = tool.lower()
+    return not any(hint in lowered for hint in _MUTATING_HINTS)
 
 
 class ToolError(Exception):
@@ -105,24 +131,63 @@ class MCPSessionExpired(MCPError):
     """The server says the MCP session is gone and must be reopened."""
 
 
+def _config_time_left(cfg: Mapping[str, Any]) -> Optional[float]:
+    """Seconds of task time remaining under the shared clock contract.
+
+    One contract, honoured by every consumer of the loop config (the
+    model client included): a ``time_left`` callable is authoritative
+    when present; otherwise a numeric ``deadline`` is a MONOTONIC
+    timestamp on the ``time.monotonic()`` base — which is what
+    serve.py supplies. Returns None when neither is known.
+    """
+    time_left = cfg.get("time_left")
+    if callable(time_left):
+        try:
+            value = time_left()
+        except Exception:
+            value = None
+        if isinstance(value, (int, float)):
+            return float(value)
+    deadline = cfg.get("deadline")
+    if isinstance(deadline, (int, float)):
+        return float(deadline) - time.monotonic()
+    return None
+
+
 # ---------------------------------------------------------------------
 # MCP catalogue schemas: compilation and argument validation
 # ---------------------------------------------------------------------
 
 MAX_LIST_PAGES = 100
 DEFAULT_MCP_CALL_TIMEOUT_SEC = 300
+DEFAULT_MAX_TOOLS_PER_SERVER = 500
 
 _SCHEMA_TYPES = ("string", "integer", "number", "boolean", "object",
                  "array", "null")
+
+# Keywords that constrain values in ways validate_arguments does not
+# check. A schema using any of them cannot compile: the tool is
+# quarantined with the keyword named, rather than offered with
+# validation silently weaker than the compile contract states.
+_UNENFORCED_KEYWORDS = ("oneOf", "anyOf", "allOf", "not", "pattern",
+                        "format", "minLength", "maxLength", "minimum",
+                        "maximum", "exclusiveMinimum",
+                        "exclusiveMaximum", "multipleOf")
+
+# Inside an ``items`` schema the validator checks only the item type,
+# so any further key is unenforced.
+_ITEMS_ENFORCED_KEYS = ("type", "description", "title")
 
 
 def _schema_problems(schema: Any, where: str = "schema") -> list[str]:
     """Structural problems that keep a JSON schema from compiling.
 
-    Only the subset the local validator enforces is checked: known
-    ``type`` values, ``properties`` as a mapping of schemas,
-    ``required`` as a list of names, and ``items`` as a schema.
-    Anything outside that subset is a compile failure, so a tool
+    The enforceable subset — the whole of what
+    :func:`validate_arguments` checks — is: known ``type`` values,
+    ``properties`` as a mapping of schemas (recursively),
+    ``required`` as a list of names, ``enum`` as a list of values,
+    and ``items`` carrying a ``type``. Anything outside that subset
+    is a compile failure naming the unenforced keyword, so a tool
     whose schema uses it is quarantined rather than offered with
     validation silently weaker than advertised.
     """
@@ -135,6 +200,18 @@ def _schema_problems(schema: Any, where: str = "schema") -> list[str]:
         for one in types:
             if one not in _SCHEMA_TYPES:
                 problems.append(f"{where}: unknown type {one!r}")
+    for keyword in _UNENFORCED_KEYWORDS:
+        if keyword in schema:
+            problems.append(
+                f"{where}: {keyword} is not enforced by the "
+                "local validator")
+    if schema.get("additionalProperties", True) is not True:
+        problems.append(
+            f"{where}: additionalProperties is not enforced by the "
+            "local validator")
+    enum = schema.get("enum")
+    if enum is not None and not isinstance(enum, (list, tuple)):
+        problems.append(f"{where}.enum: not a list of values")
     properties = schema.get("properties")
     if properties is not None:
         if not isinstance(properties, Mapping):
@@ -150,7 +227,23 @@ def _schema_problems(schema: Any, where: str = "schema") -> list[str]:
             problems.append(f"{where}.required: not a list of names")
     items = schema.get("items")
     if items is not None:
-        problems.extend(_schema_problems(items, f"{where}.items"))
+        if not isinstance(items, Mapping):
+            problems.append(f"{where}.items: not an object")
+        else:
+            for key in items:
+                if key not in _ITEMS_ENFORCED_KEYS:
+                    problems.append(
+                        f"{where}.items: {key} is not enforced by "
+                        "the local validator (only the item type "
+                        "is checked)")
+            item_type = items.get("type")
+            if item_type is not None:
+                item_types = item_type if isinstance(item_type, list) \
+                    else [item_type]
+                for one in item_types:
+                    if one not in _SCHEMA_TYPES:
+                        problems.append(
+                            f"{where}.items: unknown type {one!r}")
     return problems
 
 
@@ -175,6 +268,12 @@ def compile_tool_schema(entry: Mapping[str, Any]) -> tuple[bool, str]:
         return False, f"tool {name}: input schema type is {declared!r}, " \
                       "not \"object\""
     problems = _schema_problems(schema)
+    if "enum" in schema:
+        # validate_arguments checks an enum per property; a top-level
+        # enum on the arguments object itself is never checked.
+        problems.append(
+            "schema: a top-level enum is not enforced by the "
+            "local validator")
     if problems:
         return False, f"tool {name}: " + "; ".join(problems)
     return True, ""
@@ -445,6 +544,11 @@ class MCPLayer:
         self.max_list_pages = max(1, int(cfg.get("mcp_max_list_pages",
                                                  MAX_LIST_PAGES)))
         try:
+            self.max_tools_per_server = max(1, int(cfg.get(
+                "mcp_max_tools_per_server", DEFAULT_MAX_TOOLS_PER_SERVER)))
+        except (TypeError, ValueError):
+            self.max_tools_per_server = DEFAULT_MAX_TOOLS_PER_SERVER
+        try:
             self.call_timeout_sec = float(cfg.get(
                 "mcp_call_timeout_sec", DEFAULT_MCP_CALL_TIMEOUT_SEC))
         except (TypeError, ValueError):
@@ -465,10 +569,11 @@ class MCPLayer:
         """Seconds one MCP call may still take.
 
         The bound is the configured per-call cap, tightened by the
-        remaining task time under the same deadline machinery the
-        dispatcher uses for ``exec`` (config ``deadline`` epoch or a
-        ``time_left`` callable, minus a 2 s safety margin). No call
-        may hang past the remaining task time.
+        remaining task time under the shared clock contract (see
+        :func:`_config_time_left`: the ``time_left`` callable is
+        preferred, a numeric ``deadline`` is a monotonic timestamp),
+        minus a 2 s safety margin. No call may hang past the
+        remaining task time.
         """
         budget = self.call_timeout_sec
         if explicit is not None:
@@ -476,19 +581,7 @@ class MCPLayer:
                 budget = min(budget, float(explicit))
             except (TypeError, ValueError):
                 pass
-        remaining: Optional[float] = None
-        deadline = self._cfg.get("deadline")
-        if isinstance(deadline, (int, float)):
-            remaining = float(deadline) - time.time()
-        else:
-            time_left = self._cfg.get("time_left")
-            if callable(time_left):
-                try:
-                    value = time_left()
-                except Exception:
-                    value = None
-                if isinstance(value, (int, float)):
-                    remaining = float(value)
+        remaining = _config_time_left(self._cfg)
         if remaining is not None:
             budget = min(budget, remaining - 2)
         return budget
@@ -638,22 +731,42 @@ class MCPLayer:
         ``max_list_pages`` pages, that is recorded as a defect — an
         :class:`MCPError` the discovery path quarantines the server
         with — rather than a partial catalogue presented as whole.
+        A catalogue growing past ``max_tools_per_server`` entries is
+        the same kind of defect: the bound counts tools, not only
+        pages, so one page cannot make discovery arbitrarily heavy.
+        However a fetch fails, the entries seen before the failure
+        are attached to the raised error as ``partial_tools``, so
+        discovery's accounting never understates a partial fetch
+        as zero.
         """
         self.ensure_session(server)
         tools: list[dict[str, Any]] = []
         cursor: Optional[str] = None
-        for _ in range(self.max_list_pages):
-            page = self._rpc(server, "tools/list",
-                             {"cursor": cursor} if cursor else {})
-            found = page.get("tools") if isinstance(page.get("tools"), list) else []
-            tools.extend(t for t in found if isinstance(t, Mapping))
-            cursor = page.get("nextCursor")
-            if not cursor:
-                return tools
-        raise MCPError(
-            f"tools/list for {server}: pagination exceeded "
-            f"{self.max_list_pages} pages; the catalogue is incomplete "
-            "and is recorded as a defect, not truncated silently")
+        try:
+            for _ in range(self.max_list_pages):
+                page = self._rpc(server, "tools/list",
+                                 {"cursor": cursor} if cursor else {})
+                found = page.get("tools") if isinstance(page.get("tools"), list) else []
+                tools.extend(t for t in found if isinstance(t, Mapping))
+                if len(tools) > self.max_tools_per_server:
+                    raise MCPError(
+                        f"tools/list for {server}: catalogue exceeds "
+                        f"the per-server bound of "
+                        f"{self.max_tools_per_server} tools; recorded "
+                        "as a defect, not indexed in part")
+                cursor = page.get("nextCursor")
+                if not cursor:
+                    return tools
+            raise MCPError(
+                f"tools/list for {server}: pagination exceeded "
+                f"{self.max_list_pages} pages; the catalogue is incomplete "
+                "and is recorded as a defect, not truncated silently")
+        except Exception as exc:
+            try:
+                exc.partial_tools = list(tools)  # type: ignore[attr-defined]
+            except Exception:
+                pass
+            raise
 
     # -- discovery ---------------------------------------------------------
 
@@ -678,6 +791,11 @@ class MCPLayer:
             reason = f"{type(exc).__name__}: {exc}"
             entry["status"] = "quarantined"
             entry["reason"] = reason
+            partial = getattr(exc, "partial_tools", None)
+            if isinstance(partial, list):
+                # A fetch that failed partway still saw this many
+                # tools; the recall records what was seen, not zero.
+                entry["advertised"] = len(partial)
             self.catalogue[server] = {
                 "status": "quarantined", "reason": reason,
                 "tools": {}, "quarantined": []}
@@ -685,17 +803,32 @@ class MCPLayer:
         entry["advertised"] = len(advertised)
         tools: dict[str, dict[str, Any]] = {}
         quarantined: list[dict[str, Any]] = []
+        seen: set[str] = set()
         for raw in advertised:
             name = raw.get("name")
             if not isinstance(name, str) or not name:
-                entry["rejected"].append("<unnamed>")
+                entry["rejected"].append(
+                    {"name": "<unnamed>",
+                     "reason": "advertised tool has no usable name"})
                 continue
+            if name in seen:
+                # First occurrence wins. A repeated name is rejected
+                # with its reason — never silently shadowing the
+                # first schema, and never landing in both the
+                # callable set and the quarantine list.
+                entry["rejected"].append(
+                    {"name": name, "reason": "duplicate name"})
+                continue
+            seen.add(name)
             schema = raw.get("inputSchema", raw.get("input_schema"))
+            annotations = raw.get("annotations")
             record = {
                 "name": name,
                 "description": str(raw.get("description") or ""),
                 "input_schema": dict(schema) if isinstance(schema, Mapping)
                 else schema,
+                "annotations": dict(annotations)
+                if isinstance(annotations, Mapping) else None,
             }
             ok, why = compile_tool_schema(raw)
             if ok:
@@ -842,16 +975,48 @@ class MCPLayer:
 
     # -- calls -----------------------------------------------------------
 
+    def _catalogue_annotations(self, server: Optional[str],
+                               tool: str) -> Optional[Mapping[str, Any]]:
+        """The annotations a server advertised for one tool, or None
+        when discovery holds none: undiscovered server, unknown tool,
+        or no annotations object was advertised for it."""
+        if server is None:
+            return None
+        cat = self.catalogue.get(server) or {}
+        record = (cat.get("tools") or {}).get(tool)
+        if record is None:
+            return None
+        annotations = record.get("annotations")
+        return annotations if isinstance(annotations, Mapping) else None
+
     def is_mutating(self, tool: str,
-                    explicit: Optional[bool] = None) -> bool:
+                    explicit: Optional[bool] = None,
+                    server: Optional[str] = None) -> bool:
         """Classify a tool as mutating. The classification is a floor:
         the configured set and the name heuristic always apply, and an
         explicit caller-supplied flag may only raise the caution
-        (``True``), never lower it."""
+        (``True``), never lower it.
+
+        Server annotations, when discovery recorded them for this
+        tool, outrank the name heuristic: a ``destructiveHint`` of
+        true is mutating; a ``readOnlyHint`` of true is the server's
+        own read-only declaration and settles the question the other
+        way; an annotations object with no read-only declaration
+        means mutating unless the name is clearly read-only (a
+        leading read verb and no mutating hint). With no annotations
+        recorded, the name-hint floor alone decides.
+        """
         if explicit:
             return True
         if tool in self.mutating_tools:
             return True
+        annotations = self._catalogue_annotations(server, tool)
+        if annotations is not None:
+            if annotations.get("destructiveHint") is True:
+                return True
+            if annotations.get("readOnlyHint") is True:
+                return False
+            return not _clearly_readonly(tool)
         lowered = tool.lower()
         return any(hint in lowered for hint in _MUTATING_HINTS)
 
@@ -891,7 +1056,13 @@ class MCPLayer:
         per-call timeout (the configured cap tightened by the
         remaining task time): with no time remaining the call is
         refused before sending, and a call that returns after its
-        bound is reported as a timeout rather than trusted.
+        bound is not trusted. For a non-mutating call the late return
+        is reported as a plain timeout. For a mutating call it takes
+        the lost-response path instead (see the code): the server
+        applied the call in the meantime, so the outcome is probed,
+        and failing a confirmed effect it is reported ambiguous —
+        never as a plain timeout, which a caller could read as
+        "safe to retry" and apply the call a second time.
         """
         arguments = dict(args or {})
         refusal = self.validate_call(server, tool, arguments)
@@ -905,6 +1076,16 @@ class MCPLayer:
         result = self._call_recovering(server, tool, arguments,
                                        mutating=mutating)
         if time.monotonic() - started > budget:
+            if self.is_mutating(tool, mutating, server=server):
+                probed = self._probe(server, tool, arguments)
+                if probed is True:
+                    return {"probed": True, "effect_confirmed": True,
+                            "tool": tool, "late": True}
+                raise MCPAmbiguousResult(
+                    f"tools/call {tool}: returned after the per-call "
+                    f"timeout of {budget:.1f}s; the server may have "
+                    "applied it and the late result is not trusted; "
+                    "not retried")
             raise MCPError(
                 f"tools/call {tool}: exceeded the per-call timeout "
                 f"of {budget:.1f}s")
@@ -920,7 +1101,7 @@ class MCPLayer:
         than repeated into graded state.
         """
         arguments = dict(args or {})
-        is_mut = self.is_mutating(tool, mutating)
+        is_mut = self.is_mutating(tool, mutating, server=server)
         self.ensure_session(server)
         try:
             return self._rpc(server, "tools/call",
@@ -990,6 +1171,13 @@ class ToolDispatcher:
         self.bg_dir = Path(cfg.get("background_dir",
                                    self.workdir / ".ple-background"))
         self._background: dict[int, subprocess.Popen] = {}
+        # Background jobs started through the evaluator transport:
+        # pid -> start record. There is no local process handle for
+        # these; they are stopped with a kill frame (see
+        # stop_background_remote) and any pid whose death could not
+        # be confirmed lands in unreconciled_background.
+        self._background_remote: dict[int, dict[str, Any]] = {}
+        self.unreconciled_background: list[int] = []
         if mcp_layer is not None:
             self.mcp = mcp_layer
         else:
@@ -1311,23 +1499,15 @@ class ToolDispatcher:
 
     def _remaining_timeout(self, deadline: Optional[float]) -> Optional[int]:
         """Seconds of task time left (minus a safety margin), or None
-        when no deadline is known."""
+        when no deadline is known. A numeric deadline — the argument
+        or the config's — is a monotonic timestamp under the shared
+        clock contract (see :func:`_config_time_left`); the config's
+        ``time_left`` callable is preferred when present."""
         remaining: Optional[float] = None
         if deadline is not None:
-            remaining = float(deadline) - time.time()
+            remaining = float(deadline) - time.monotonic()
         else:
-            cfg_deadline = self.config.get("deadline")
-            if isinstance(cfg_deadline, (int, float)):
-                remaining = float(cfg_deadline) - time.time()
-            else:
-                time_left = self.config.get("time_left")
-                if callable(time_left):
-                    try:
-                        value = time_left()
-                    except Exception:
-                        value = None
-                    if isinstance(value, (int, float)):
-                        remaining = float(value)
+            remaining = _config_time_left(self.config)
         if remaining is None:
             return None
         return int(remaining - 2)
@@ -1362,6 +1542,12 @@ class ToolDispatcher:
                 raise ToolError(f"exec: {result.get('error') or 'failed'}")
             pid_text = str(result.get("output") or "").strip().splitlines()
             pid = int(pid_text[-1]) if pid_text and pid_text[-1].isdigit() else None
+            if pid is not None:
+                # Register the job exactly as the local path does, so
+                # stop_all_background can act on it; the start wrapper
+                # used setsid, so the process group id is the pid.
+                self._background_remote[pid] = {"log_path": log_rel,
+                                                "job": job}
             return _result(True, f"background job started (pid {pid})",
                            {"background": True, "pid": pid,
                             "process_group": pid, "log_path": log_rel,
@@ -1396,13 +1582,52 @@ class ToolDispatcher:
                 del self._background[pid]
         return finished
 
+    def stop_background_remote(self, pid: int) -> bool:
+        """Stop a background job started through the evaluator
+        transport. The job runs in its own process group (the start
+        wrapper used ``setsid``, so the group id is the pid); the
+        stop is one exec frame that signals the group — SIGTERM,
+        then SIGKILL — and reports whether the group is gone.
+        Returns True only when the frame confirms the group is dead.
+        Anything else (frame refused, transport error, group still
+        alive) leaves the pid registered, so a later call retries
+        it, and records it in ``unreconciled_background`` so the
+        harness's record never claims a stop that was not confirmed.
+        """
+        pid = int(pid)
+        if pid not in self._background_remote:
+            return False
+        command = (
+            f"kill -TERM -{pid} 2>/dev/null; sleep 1; "
+            f"kill -KILL -{pid} 2>/dev/null; "
+            f"if kill -0 -{pid} 2>/dev/null; then echo alive; "
+            "else echo dead; fi")
+        confirmed = False
+        try:
+            result = self._request({"type": "exec", "command": command,
+                                    "timeout_sec": 10})
+            lines = str(result.get("output") or "").strip().splitlines()
+            confirmed = bool(result.get("ok", True)) and bool(lines) \
+                and lines[-1].strip() == "dead"
+        except Exception:
+            confirmed = False
+        if confirmed:
+            del self._background_remote[pid]
+            if pid in self.unreconciled_background:
+                self.unreconciled_background.remove(pid)
+        elif pid not in self.unreconciled_background:
+            self.unreconciled_background.append(pid)
+        return confirmed
+
     def stop_background(self, pid: int) -> bool:
-        """Stop a registered local background job: SIGTERM its process
+        """Stop a registered background job: SIGTERM its process
         group, then SIGKILL if it has not exited. Only jobs this
         dispatcher started are ever signalled. Returns True only when
         the job is actually finished afterwards."""
         proc = self._background.get(int(pid))
         if proc is None:
+            if int(pid) in self._background_remote:
+                return self.stop_background_remote(pid)
             return False
         if proc.poll() is not None:
             del self._background[int(pid)]
@@ -1434,14 +1659,23 @@ class ToolDispatcher:
         return done
 
     def stop_all_background(self) -> int:
-        """Stop every registered background job. The harness calls
-        this before finishing so no started job outlives the task.
-        Returns how many jobs were stopped."""
+        """Stop every registered background job, local and
+        transport-started alike. The harness calls this before
+        finishing so no started job outlives the task. Returns how
+        many jobs were stopped or had a stop attempted: local jobs
+        count when actually stopped; transport jobs count when the
+        stop was attempted, with the pids whose death could not be
+        confirmed exposed in ``unreconciled_background`` (and left
+        registered, so a later call retries them) to keep the
+        harness's record honest."""
         self.reap_background()
         stopped = 0
         for pid in list(self._background):
             if self.stop_background(pid):
                 stopped += 1
+        for pid in list(self._background_remote):
+            self.stop_background_remote(pid)
+            stopped += 1
         return stopped
 
     # -- mcp -------------------------------------------------------------------
