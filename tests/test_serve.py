@@ -7,8 +7,10 @@ Run from the build directory:
 import asyncio
 import base64
 import json
+import os
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -392,6 +394,172 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(terminal), 1)
         self.assertEqual(terminal[0]["type"], "error")
         self.assertIn("expected a task message first", terminal[0]["message"])
+
+
+class NulRefusalTests(unittest.IsolatedAsyncioTestCase):
+    """Fix round: NULs in fields the evaluator acts on are refused."""
+
+    def make(self, servers=()):
+        sent = []
+
+        async def raw(payload):
+            sent.append(payload)
+
+        return serve.Serialiser(raw, list(servers)), sent
+
+    async def test_nul_in_command_path_url_refused(self):
+        servers = [{"name": "docs", "url": "http://mcp.local/sse"}]
+        s, sent = self.make(servers)
+        frames = [
+            {"type": "exec", "id": "1", "command": "cat /app/a\x00b"},
+            {"type": "read_file", "id": "1",
+             "path": "/app/\x00../../etc/passwd"},
+            {"type": "write_file", "id": "1", "path": "/app/x\x00y",
+             "content_b64": ""},
+            {"type": "http", "id": "1", "url": "http://mcp.local/sse\x00x"},
+        ]
+        for frame in frames:
+            with self.assertRaises(serve.FrameError, msg=frame["type"]):
+                await s.send(frame)
+        self.assertEqual(sent, [])  # nothing was sent for any of them
+
+    async def test_nul_in_log_text_still_stripped(self):
+        s, sent = self.make()
+        await s.send({"type": "log", "text": "a\x00b"})
+        self.assertEqual(json.loads(sent[0])["text"], "ab")
+
+
+class TerminalSendFailureTests(unittest.IsolatedAsyncioTestCase):
+    """Fix round: a failed terminal send gets one fallback attempt."""
+
+    async def test_terminal_send_retried_once(self):
+        attempts = []
+
+        async def raw(payload):
+            attempts.append(payload)
+            if len(attempts) == 1:
+                raise RuntimeError("transient send failure")
+
+        s = serve.Serialiser(raw, [])
+        self.assertTrue(await s.send_terminal("done", "ok"))
+        self.assertEqual(len(attempts), 2)
+        self.assertTrue(s.terminal_claimed)
+
+    async def test_terminal_send_double_failure_releases_claim(self):
+        async def raw(payload):
+            raise RuntimeError("send is down")
+
+        s = serve.Serialiser(raw, [])
+        with self.assertRaises(RuntimeError):
+            await s.send_terminal("done", "ok")
+        self.assertFalse(s.terminal_claimed)
+
+
+class FixSessionTests(unittest.IsolatedAsyncioTestCase):
+    """Fix round: transport wiring, semaphore re-check, state dir."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.config = {"state_root": self.tmp.name}
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def start(self, runner, frame=None):
+        ws = FakeWS()
+        session = serve.Session(ws, runner, self.config)
+        run_task = asyncio.ensure_future(session.run())
+        ws.feed(TASK_FRAME if frame is None else frame)
+        return ws, session, run_task
+
+    async def settle(self):
+        await asyncio.sleep(0.05)
+
+    async def test_loop_config_wires_emit_as_tool_transport(self):
+        # The harness resolves its tool transport from the config:
+        # `request`/`transport` first, then the emit itself when
+        # `emit_is_transport` is set. This runner performs exactly
+        # that resolution and drives an exec and an http (MCP) call
+        # through it; both must travel as session request frames.
+        seen = {}
+
+        def runner(task, emit, workdir, config):
+            seen.update(config)
+            request = config.get("request") or config.get("transport")
+            if request is None and config.get("emit_is_transport"):
+                request = emit
+            seen["request"] = request
+            result = request({"type": "exec", "command": "ls"})
+            seen["exec_output"] = result["output"]
+            reply = request({"type": "http",
+                             "url": "http://mcp.local/sse",
+                             "method": "POST"})
+            seen["http_ok"] = reply["ok"]
+            return {"status": "done", "final_message": result["output"]}
+
+        frame = {**TASK_FRAME,
+                 "mcp_servers": [{"name": "docs",
+                                  "url": "http://mcp.local/sse"}]}
+        ws, session, run_task = self.start(runner, frame)
+        self.assertTrue(await wait_for(lambda: len(ws.requests()) == 1))
+        self.assertEqual(ws.requests()[0]["type"], "exec")
+        ws.feed({"type": "result", "id": ws.requests()[0]["id"],
+                 "ok": True, "output": "wired"})
+        self.assertTrue(await wait_for(lambda: len(ws.requests()) == 2))
+        self.assertEqual(ws.requests()[1]["type"], "http")
+        ws.feed({"type": "result", "id": ws.requests()[1]["id"],
+                 "ok": True})
+        await asyncio.wait_for(run_task, 5)
+        await self.settle()
+        self.assertIs(seen["emit_is_transport"], True)
+        self.assertIsNotNone(seen["request"])
+        self.assertIsInstance(seen["cancel_flag"], threading.Event)
+        self.assertIsInstance(seen["finalize_flag"], threading.Event)
+        self.assertEqual(seen["exec_output"], "wired")
+        self.assertIs(seen["http_ok"], True)
+        terminal = ws.terminal()
+        self.assertEqual(len(terminal), 1)
+        self.assertEqual(terminal[0]["type"], "done")
+        self.assertEqual(terminal[0]["final_message"], "wired")
+
+    async def test_request_blocked_on_semaphore_not_sent_after_cancel(self):
+        async def runner(task, emit, workdir, config):
+            async def one():
+                try:
+                    await emit({"type": "exec", "command": "x"})
+                except serve.SessionCancelled:
+                    return "cancelled"
+                return "answered"
+
+            results = await asyncio.gather(
+                *(one() for _ in range(serve.MAX_IN_FLIGHT + 1)))
+            return {"status": "done", "final_message": ",".join(results)}
+
+        ws, session, run_task = self.start(runner)
+        self.assertTrue(
+            await wait_for(lambda: len(ws.requests()) == serve.MAX_IN_FLIGHT))
+        await asyncio.sleep(0.1)  # the extra request waits on the semaphore
+        ws.feed({"type": "cancel", "reason": "timeout"})
+        await asyncio.wait_for(run_task, 5)
+        await self.settle()
+        # The blocked request was never sent once the cancel landed.
+        self.assertEqual(len(ws.requests()), serve.MAX_IN_FLIGHT)
+        terminal = ws.terminal()
+        self.assertEqual(len(terminal), 1)
+        self.assertEqual(terminal[0]["type"], "done")
+
+    async def test_session_id_cannot_escape_state_root(self):
+        async def runner(task, emit, workdir, config):
+            return {"status": "done", "final_message": "ok"}
+
+        frame = {**TASK_FRAME, "session": "../../escaped-state"}
+        ws, session, run_task = self.start(runner, frame)
+        await asyncio.wait_for(run_task, 5)
+        root = Path(self.tmp.name)
+        self.assertIsNotNone(session.state_dir)
+        self.assertTrue(str(session.state_dir).startswith(str(root)))
+        escaped = Path(os.path.normpath(root / ".." / ".." / "escaped-state"))
+        self.assertFalse(escaped.exists())
 
 
 if __name__ == "__main__":

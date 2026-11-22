@@ -46,6 +46,13 @@ def normalize_usage(raw: Any) -> tuple[dict[str, int], list[str]]:
     true integer in ``0 .. 2**53 - 1`` becomes 0 and is listed as a
     defect. Cache-write counts are read from the common field names.
     Never raises.
+
+    Cache-read precedence is fixed: a top-level count
+    (``cache_read_tokens``, then ``cached_tokens``) is authoritative.
+    ``prompt_tokens_details.cached_tokens`` is used only when no
+    top-level count is present; when both are present, valid, and
+    disagree, the top-level value stands and the disagreement is
+    recorded as a defect.
     """
     counts = {name: 0 for name in TOKEN_FIELDS}
     defects: list[str] = []
@@ -61,10 +68,6 @@ def normalize_usage(raw: Any) -> tuple[dict[str, int], list[str]]:
                                "cache_creation_input_tokens",
                                "cache_write_input_tokens"),
     }
-    details = raw.get("prompt_tokens_details")
-    if isinstance(details, Mapping):
-        if counts["cache_read_tokens"] == 0 and "cached_tokens" in details:
-            raw = {**raw, "cache_read_tokens": details.get("cached_tokens")}
     for field_name, names in aliases.items():
         value = None
         present = False
@@ -80,6 +83,32 @@ def normalize_usage(raw: Any) -> tuple[dict[str, int], list[str]]:
         else:
             counts[field_name] = 0
             defects.append(f"{field_name} was not a valid count")
+    # Cache-read fallback and disagreement check (see the docstring):
+    # prompt_tokens_details.cached_tokens fills in only when no
+    # top-level count was present, and never overrides one.
+    top_value: Any = None
+    for name in ("cache_read_tokens", "cached_tokens"):
+        if raw.get(name) is not None:
+            top_value = raw.get(name)
+            break
+    details = raw.get("prompt_tokens_details")
+    if isinstance(details, Mapping) and "cached_tokens" in details:
+        detail_value = details.get("cached_tokens")
+        if top_value is None:
+            if _is_true_int(detail_value) and 0 <= detail_value <= MAX_COUNT:
+                counts["cache_read_tokens"] = int(detail_value)
+            elif detail_value is not None:
+                counts["cache_read_tokens"] = 0
+                defects.append("cache_read_tokens was not a valid count")
+        elif (
+            _is_true_int(top_value)
+            and _is_true_int(detail_value)
+            and int(top_value) != int(detail_value)
+        ):
+            defects.append(
+                "cache_read_tokens disagrees with "
+                "prompt_tokens_details.cached_tokens; top-level value used"
+            )
     return counts, defects
 
 
@@ -287,6 +316,50 @@ class ModelClient:
         self.max_output_tokens = cfg.get("max_output_tokens")
         self.defects: list[str] = []
         self._seq = 0
+        # Session stop signals, threaded in through the config by
+        # serve.py: threading flags first (safe to poll from any
+        # thread), asyncio events as a fallback, then the deadline
+        # sources. Polled between streamed chunks in `complete`.
+        self._cancel_signal = cfg.get("cancel_flag") or cfg.get("cancel_event")
+        self._finalize_signal = (
+            cfg.get("finalize_flag") or cfg.get("finalize_event"))
+        time_left = cfg.get("time_left")
+        self._time_left = time_left if callable(time_left) else None
+        deadline = cfg.get("deadline")
+        self._deadline = (
+            float(deadline)
+            if isinstance(deadline, (int, float))
+            and not isinstance(deadline, bool)
+            else None
+        )
+
+    def _stop_requested(self) -> Optional[str]:
+        """Why the session wants this call stopped, or None.
+
+        Cancel and finalize signals and the task deadline, checked
+        between streamed chunks so a long or stalled stream yields
+        instead of running on after the session has moved on.
+        """
+        for signal, why in (
+            (self._cancel_signal, "cancelled"),
+            (self._finalize_signal, "finalize requested"),
+        ):
+            if signal is not None:
+                try:
+                    if signal.is_set():
+                        return why
+                except Exception:
+                    pass
+        if self._time_left is not None:
+            try:
+                left = self._time_left()
+            except Exception:
+                left = None
+            if left is not None and left <= 0:
+                return "deadline reached"
+        elif self._deadline is not None and time.monotonic() >= self._deadline:
+            return "deadline reached"
+        return None
 
     # -- ledger ------------------------------------------------------
 
@@ -317,6 +390,15 @@ class ModelClient:
             try:
                 self.emit(frame)
             except Exception as exc:
+                # A cancellation raised by the emit (the session
+                # layer's SessionCancelled) is not a defect to
+                # record and continue past: it must reach the loop,
+                # or the call returns normally and work continues
+                # after the session has ended. Matched by class name
+                # so this module needs no import of the session
+                # layer.
+                if type(exc).__name__ == "SessionCancelled":
+                    raise
                 self.defects.append(f"usage emit failed: {exc}")
         return record
 
@@ -365,7 +447,9 @@ class ModelClient:
                 return []
             if isinstance(produced, Mapping):
                 return [produced]
-            return list(produced)
+            # Returned as-is, never materialised: the caller walks
+            # the stream chunk by chunk and can stop between chunks.
+            return produced
         return self._http_chunks(payload)
 
     # -- calls ---------------------------------------------------------
@@ -394,9 +478,15 @@ class ModelClient:
         """Run one model call and return its normalised response.
 
         Retries apply only before the first streamed chunk arrives
-        (429/5xx and connection failures). Once chunks have arrived, an
+        (429/5xx and connection failures). A failure before any chunk
+        — including a pre-stream HTTP error such as 400 or 401 — is a
+        hard ``ModelCallError``: no usage is recorded for a call the
+        gateway never accepted. Once chunks have arrived, an
         interruption raises ``ModelCallInterrupted`` with the partial
-        response and the usage confirmed so far already recorded.
+        response and the usage confirmed so far already recorded. The
+        session's stop signals are checked between chunks, so a
+        cancelled or deadline-expired session stops the stream at
+        the next chunk instead of running to its end.
         """
         payload = self.build_payload(messages, tools, **overrides)
         attempt = 0
@@ -406,8 +496,13 @@ class ModelClient:
             usage_raw: Any = None
             finish_reason: Optional[str] = None
             started = False
+            stopped: Optional[str] = None
             try:
                 for chunk in self._chunks(payload):
+                    stop = self._stop_requested()
+                    if stop is not None:
+                        stopped = stop
+                        break
                     started = True
                     if not isinstance(chunk, Mapping):
                         continue
@@ -444,14 +539,19 @@ class ModelClient:
                                 slot["_args_text"] = slot.get("_args_text", "") + piece
                             elif isinstance(piece, Mapping):
                                 slot["arguments"] = dict(piece)
-                break
             except urllib.error.HTTPError as exc:
-                if not started and exc.code in (408, 409, 429) or (
-                        not started and exc.code >= 500):
-                    if attempt < len(self.retry_delays):
-                        time.sleep(self.retry_delays[attempt])
-                        attempt += 1
-                        continue
+                if not started:
+                    # Nothing was streamed: the gateway rejected the
+                    # call outright. Retry the transient codes, then
+                    # fail hard — never as an interruption with an
+                    # empty partial and a zero usage record.
+                    if exc.code in (408, 409, 429) or exc.code >= 500:
+                        if attempt < len(self.retry_delays):
+                            time.sleep(self.retry_delays[attempt])
+                            attempt += 1
+                            continue
+                    raise ModelCallError(
+                        f"model call failed: HTTP {exc.code}") from exc
                 counts, defects = normalize_usage(usage_raw)
                 partial = self._finish(content_parts, tool_parts, counts,
                                        finish_reason, None)
@@ -466,15 +566,24 @@ class ModelClient:
                     time.sleep(self.retry_delays[attempt])
                     attempt += 1
                     continue
+                if not started:
+                    raise ModelCallError(f"model call failed: {exc}") from exc
                 counts, defects = normalize_usage(usage_raw)
                 partial = self._finish(content_parts, tool_parts, counts,
                                        finish_reason, None)
                 self._record_usage(phase, counts, defects)
                 partial.usage_recorded = True
-                if started:
-                    raise ModelCallInterrupted(
-                        f"model call interrupted: {exc}", partial) from exc
-                raise ModelCallError(f"model call failed: {exc}") from exc
+                raise ModelCallInterrupted(
+                    f"model call interrupted: {exc}", partial) from exc
+            if stopped is not None:
+                counts, defects = normalize_usage(usage_raw)
+                partial = self._finish(content_parts, tool_parts, counts,
+                                       finish_reason, None)
+                self._record_usage(phase, counts, defects)
+                partial.usage_recorded = True
+                raise ModelCallInterrupted(
+                    f"model call stopped: {stopped}", partial)
+            break
         counts, defects = normalize_usage(usage_raw)
         response = self._finish(content_parts, tool_parts, counts,
                                 finish_reason, None)

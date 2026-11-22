@@ -62,6 +62,18 @@ class BudgetExceeded(Exception):
     """A phase tried to spend past its allocation or into the reserve."""
 
 
+def _is_session_cancelled(exc: BaseException) -> bool:
+    """True for the session layer's cancellation exception.
+
+    Matched by class name so this module never imports the session
+    layer at load time (which would be circular); a cancellation
+    raised anywhere below the loop must propagate, never be folded
+    into an ordinary result or outcome.
+    """
+    return any(cls.__name__ == "SessionCancelled"
+               for cls in type(exc).__mro__)
+
+
 class BudgetGovernor:
     """Absolute token/call budgets with a protected reserve.
 
@@ -91,6 +103,7 @@ class BudgetGovernor:
         self.reserve_calls = max(0, int(reserve_calls))
         self.spent: dict[str, int] = {p: 0 for p in PHASES}
         self.calls: dict[str, int] = {p: 0 for p in PHASES}
+        self.overrun_tokens = 0
 
     @property
     def spent_total(self) -> int:
@@ -117,13 +130,11 @@ class BudgetGovernor:
             if self.spent_total + amount > self.non_reserve_ceiling:
                 return False
         if phase in self.allocations:
-            if self.spent.get(phase, 0) + amount > max(
-                    self.phase_ceiling(phase),
-                    self.reserve_tokens if phase in self.RESERVE_PHASES else 0):
-                # A reserve phase may always use at least the reserve.
-                if not (phase in self.RESERVE_PHASES
-                        and self.spent_total + amount <= self.total_tokens):
-                    return False
+            # Per-phase allocations bind every phase, reserve phases
+            # included: verify and finalize each hold only their own
+            # share of the budget.
+            if self.spent.get(phase, 0) + amount > self.phase_ceiling(phase):
+                return False
         return True
 
     def spend(self, phase: str, amount: int) -> None:
@@ -135,13 +146,31 @@ class BudgetGovernor:
         self.spent[phase] = self.spent.get(phase, 0) + int(amount)
 
     def record_spend(self, phase: str, amount: int) -> bool:
-        """Charge an actual call cost; False when it broke the budget."""
-        try:
-            self.spend(phase, amount)
-            return True
-        except BudgetExceeded:
-            self.spent[phase] = self.spent.get(phase, 0) + int(amount)
+        """Charge an actual call cost; False when it broke the budget.
+
+        The charge is split so the protected reserve stays inviolable:
+        a non-reserve phase is charged only up to the non-reserve
+        ceiling (and its own phase ceiling), a reserve phase only up
+        to the total cap (and its own phase ceiling). Any excess is
+        recorded as an overrun defect instead of being spent out of
+        another phase's allocation, and False tells the caller to
+        stop the phase.
+        """
+        amount = int(amount)
+        if phase in self.RESERVE_PHASES:
+            headroom = self.total_tokens - self.spent_total
+        else:
+            headroom = self.non_reserve_ceiling - self.spent_total
+        if phase in self.allocations:
+            headroom = min(headroom, self.phase_ceiling(phase)
+                           - self.spent.get(phase, 0))
+        charge = max(0, min(amount, headroom))
+        self.spent[phase] = self.spent.get(phase, 0) + charge
+        excess = amount - charge
+        if excess > 0:
+            self.overrun_tokens += excess
             return False
+        return True
 
     def can_call(self, phase: str) -> bool:
         if self.calls_total + 1 > self.total_calls:
@@ -165,6 +194,7 @@ class BudgetGovernor:
             "calls": dict(self.calls),
             "calls_total": self.calls_total,
             "allocations": dict(self.allocations),
+            "overrun_tokens": self.overrun_tokens,
         }
 
 
@@ -174,7 +204,8 @@ class BudgetGovernor:
 
 def _atomic_write(path: Path, data: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp = path.with_name(
+        f"{path.name}.{os.getpid()}.{os.urandom(6).hex()}.tmp")
     with open(tmp, "wb") as handle:
         handle.write(data)
         handle.flush()
@@ -189,10 +220,123 @@ def _atomic_write_json(path: Path, value: Any) -> None:
 
 SUMMARY_FIELDS = (
     "task_id", "phase", "turn_count", "model_calls", "usage",
-    "deliverables", "constraints", "work_items", "checks",
-    "decisions", "dead_ends", "recent_actions", "dropped_actions",
-    "all_hard_checks_pass", "updated_seq",
+    "usage_defects", "deliverables", "constraints", "work_items",
+    "checks", "decisions", "dead_ends", "recent_actions",
+    "dropped_actions", "dropped_entries", "all_hard_checks_pass",
+    "updated_seq",
 )
+
+# Fold-time bounds: long model-authored strings are truncated in the
+# summary (the ledger event keeps the full text) so no single field
+# can push the summary past its cap on its own.
+FOLD_TEXT_CHARS = 240
+
+
+def _empty_summary(task_id: str) -> dict[str, Any]:
+    return {
+        "task_id": task_id,
+        "phase": "brief",
+        "turn_count": 0,
+        "model_calls": 0,
+        "usage": {"input_tokens": 0, "output_tokens": 0,
+                  "cache_read_tokens": 0, "cache_write_tokens": 0},
+        "usage_defects": [],
+        "deliverables": {},
+        "constraints": {},
+        "work_items": {},
+        "checks": {},
+        "decisions": [],
+        "dead_ends": [],
+        "recent_actions": [],
+        "dropped_actions": 0,
+        "dropped_entries": 0,
+        "all_hard_checks_pass": False,
+        "updated_seq": 0,
+    }
+
+
+def _truncate_span(span: Any) -> Any:
+    if isinstance(span, dict):
+        out = dict(span)
+        if isinstance(out.get("quote"), str):
+            out["quote"] = out["quote"][:FOLD_TEXT_CHARS]
+        return out
+    if isinstance(span, str):
+        return span[:FOLD_TEXT_CHARS]
+    return span
+
+
+def _compact_summary_dict(summary: dict[str, Any],
+                          cap_bytes: int = SUMMARY_CAP_BYTES
+                          ) -> dict[str, Any]:
+    """Return ``summary`` degraded to fit ``cap_bytes``; never raises.
+
+    Degradation order: oldest action detail first (counted), then
+    action detail text, constraint text and work-item titles, check
+    evidence, then per-entry detail (status-only entries), then whole
+    map entries (counted). Decisions and dead ends are the protected
+    record: they are trimmed in place, never evicted, ahead of any
+    map entry being dropped.
+    """
+    summary = copy.deepcopy(summary)
+    summary["dropped_actions"] = int(summary.get("dropped_actions", 0))
+    summary["dropped_entries"] = int(summary.get("dropped_entries", 0))
+
+    def size() -> int:
+        return len(json.dumps(summary, ensure_ascii=False,
+                              sort_keys=True).encode("utf-8"))
+
+    while size() > cap_bytes and summary["recent_actions"]:
+        summary["recent_actions"].pop(0)
+        summary["dropped_actions"] += 1
+    if size() > cap_bytes:
+        for entry in summary["recent_actions"]:
+            entry["detail"] = str(entry.get("detail", ""))[:80]
+    if size() > cap_bytes:
+        for entry in summary["constraints"].values():
+            entry["text"] = str(entry.get("text", ""))[:120]
+            if "source_span" in entry:
+                entry["source_span"] = _truncate_span(entry["source_span"])
+        for entry in summary["work_items"].values():
+            entry["title"] = str(entry.get("title", ""))[:120]
+    if size() > cap_bytes:
+        checks = summary.get("checks") or {}
+        for section in ("constraints", "consistency"):
+            for entry in (checks.get(section) or {}).values():
+                if isinstance(entry, dict) and "evidence" in entry:
+                    entry["evidence"] = str(entry["evidence"])[:80]
+    if size() > cap_bytes:
+        for key in ("decisions", "dead_ends"):
+            summary[key] = [str(text)[:120] for text in summary[key]]
+    if size() > cap_bytes:
+        summary["deliverables"] = {
+            path: {"status": entry.get("status")}
+            for path, entry in summary["deliverables"].items()}
+        summary["constraints"] = {
+            cid: {"status": entry.get("status"), "hard": entry.get("hard")}
+            for cid, entry in summary["constraints"].items()}
+        summary["work_items"] = {
+            wid: {"status": entry.get("status")}
+            for wid, entry in summary["work_items"].items()}
+        summary["checks"] = {}
+    for key in ("deliverables", "constraints", "work_items"):
+        while size() > cap_bytes and summary[key]:
+            summary[key].pop(next(iter(summary[key])))
+            summary["dropped_entries"] += 1
+    if size() > cap_bytes:
+        for key in ("decisions", "dead_ends"):
+            summary[key] = [str(text)[:32] for text in summary[key]]
+    while size() > cap_bytes and (summary["decisions"]
+                                  or summary["dead_ends"]):
+        # Absolute last resort, reachable only with tens of thousands
+        # of protected entries: trim the oldest protected entries and
+        # count them, rather than raising out of the loop.
+        if summary["dead_ends"]:
+            summary["dead_ends"].pop(0)
+        else:
+            summary["decisions"].pop(0)
+        summary["dropped_entries"] += 1
+    return summary
 
 
 class LedgerState:
@@ -211,24 +355,7 @@ class LedgerState:
         self.ledger_path = self.dir / "ledger.jsonl"
         self.summary_path = self.dir / "summary.json"
         self.seq = 0
-        self.summary: dict[str, Any] = {
-            "task_id": task_id,
-            "phase": "brief",
-            "turn_count": 0,
-            "model_calls": 0,
-            "usage": {"input_tokens": 0, "output_tokens": 0,
-                      "cache_read_tokens": 0, "cache_write_tokens": 0},
-            "deliverables": {},
-            "constraints": {},
-            "work_items": {},
-            "checks": {},
-            "decisions": [],
-            "dead_ends": [],
-            "recent_actions": [],
-            "dropped_actions": 0,
-            "all_hard_checks_pass": False,
-            "updated_seq": 0,
-        }
+        self.summary: dict[str, Any] = _empty_summary(task_id)
         if self.summary_path.exists():
             try:
                 loaded = json.loads(self.summary_path.read_text("utf-8"))
@@ -255,7 +382,8 @@ class LedgerState:
         return self.append_event(
             "usage", phase=record.get("phase", "execute"),
             model=record.get("model"),
-            usage={k: int(record.get(k, 0)) for k in self.summary["usage"]})
+            usage={k: int(record.get(k, 0)) for k in self.summary["usage"]},
+            defects=[str(d) for d in (record.get("defects") or [])])
 
     def _fold(self, event: Mapping[str, Any]) -> None:
         kind = event.get("kind")
@@ -265,6 +393,10 @@ class LedgerState:
             for key in summary["usage"]:
                 summary["usage"][key] += int(usage.get(key, 0))
             summary["model_calls"] += 1
+            defects = summary.setdefault("usage_defects", [])
+            for defect in event.get("defects") or []:
+                if len(defects) < 50:
+                    defects.append(str(defect))
         elif kind == "turn":
             summary["turn_count"] = int(event.get("turn", summary["turn_count"]))
         elif kind == "phase":
@@ -288,13 +420,21 @@ class LedgerState:
                 str(event.get("id")), {})
             for key in ("text", "hard", "status", "source_span"):
                 if event.get(key) is not None:
-                    entry[key] = event[key]
+                    value = event[key]
+                    if key == "text":
+                        value = str(value)[:FOLD_TEXT_CHARS]
+                    elif key == "source_span":
+                        value = _truncate_span(value)
+                    entry[key] = value
         elif kind == "work_item":
             entry = summary["work_items"].setdefault(
                 str(event.get("id")), {})
-            for key in ("title", "status", "reason"):
+            for key in ("title", "status", "reason", "acceptance_status"):
                 if event.get(key) is not None:
-                    entry[key] = event[key]
+                    value = event[key]
+                    if key == "title":
+                        value = str(value)[:FOLD_TEXT_CHARS]
+                    entry[key] = value
         elif kind == "checks":
             summary["checks"] = event.get("checks") or {}
             summary["all_hard_checks_pass"] = bool(
@@ -305,17 +445,18 @@ class LedgerState:
             summary["dead_ends"].append(str(event.get("text", ""))[:500])
 
     def rebuild_summary(self) -> dict[str, Any]:
-        """Regenerate the summary from the ledger alone."""
+        """Regenerate the summary from the ledger alone.
+
+        The fold starts from a genuinely empty summary — nothing is
+        seeded from the in-memory summary — and the result passes
+        through the same compaction as :meth:`persist`, so a rebuild
+        of an uncompacted fold equals the persisted summary exactly.
+        """
         fresh = LedgerState.__new__(LedgerState)
         fresh.dir, fresh.task_id = self.dir, self.task_id
         fresh.ledger_path, fresh.summary_path = self.ledger_path, self.summary_path
         fresh.seq = 0
-        fresh.summary = copy.deepcopy(self.summary)
-        for key in ("turn_count", "model_calls", "dropped_actions"):
-            fresh.summary[key] = 0
-        fresh.summary["usage"] = {k: 0 for k in self.summary["usage"]}
-        for key in ("recent_actions", "decisions", "dead_ends"):
-            fresh.summary[key] = []
+        fresh.summary = _empty_summary(self.task_id)
         if self.ledger_path.exists():
             for line in self.ledger_path.read_text("utf-8").splitlines():
                 if not line.strip():
@@ -324,36 +465,13 @@ class LedgerState:
                 fresh.seq = int(event.get("seq", fresh.seq))
                 fresh._fold(event)
                 fresh.summary["updated_seq"] = fresh.seq
-        return fresh.summary
+        return _compact_summary_dict(fresh.summary)
 
     # -- compaction ------------------------------------------------------
 
     def compact_summary(self, cap_bytes: int = SUMMARY_CAP_BYTES) -> dict[str, Any]:
-        """The closing summary, capped: oldest action detail goes first."""
-        summary = copy.deepcopy(self.summary)
-        summary["dropped_actions"] = int(summary.get("dropped_actions", 0))
-
-        def size() -> int:
-            return len(json.dumps(summary, ensure_ascii=False,
-                                  sort_keys=True).encode("utf-8"))
-
-        while size() > cap_bytes and summary["recent_actions"]:
-            summary["recent_actions"].pop(0)
-            summary["dropped_actions"] += 1
-        while size() > cap_bytes and summary["dead_ends"]:
-            summary["dead_ends"].pop(0)
-        while size() > cap_bytes and summary["decisions"]:
-            summary["decisions"].pop(0)
-        if size() > cap_bytes:
-            for entry in summary["recent_actions"]:
-                entry["detail"] = entry.get("detail", "")[:80]
-        if size() > cap_bytes:
-            blob = json.dumps(summary, ensure_ascii=False,
-                              sort_keys=True).encode("utf-8")
-            raise ValueError(
-                f"summary is {len(blob)} bytes, over the {cap_bytes} cap, "
-                "with no droppable detail left")
-        return summary
+        """The closing summary, capped; degrades, never raises."""
+        return _compact_summary_dict(self.summary, cap_bytes)
 
     def persist(self) -> dict[str, Any]:
         compact = self.compact_summary()
@@ -362,6 +480,13 @@ class LedgerState:
 
     def closing_summary_text(self) -> str:
         """Defined-structure closing summary, within the 64 KiB cap."""
+        try:
+            return self._closing_summary_text()
+        except Exception:
+            return (f"Task {self.task_id}: closing summary unavailable; "
+                    "see the run record.")
+
+    def _closing_summary_text(self) -> str:
         summary = self.compact_summary()
         lines = [f"Task {summary['task_id']}: phase {summary['phase']}, "
                  f"{summary['turn_count']} turns, "
@@ -435,7 +560,9 @@ class DeliverableStore:
         try:
             data, _ = self.tools.read_bytes(path)
             return data
-        except Exception:
+        except Exception as exc:
+            if _is_session_cancelled(exc):
+                raise
             return None
 
     def sync_from_graded(self, path: str) -> Optional[dict[str, Any]]:
@@ -505,14 +632,48 @@ def all_hard_checks_pass(checks: Mapping[str, Any]) -> bool:
     """True only when every constraint is resolved and passing.
 
     An UNRESOLVED constraint blocks the claim whatever its declared
-    severity, as does any hard constraint not in PASS.
+    severity, as does any hard constraint not in PASS. The claim is
+    never vacuous: an empty constraint set is not a pass, and the
+    consistency section must be clean as well.
     """
     constraints = checks.get("constraints") or {}
+    if not constraints:
+        return False
     for entry in constraints.values():
         status = entry.get("status")
         if status == "UNRESOLVED":
             return False
         if entry.get("hard") and status != "PASS":
+            return False
+    for entry in (checks.get("consistency") or {}).values():
+        if entry.get("status") != "PASS":
+            return False
+    return True
+
+
+def deliverable_checks_pass(checks: Mapping[str, Any],
+                            brief: Mapping[str, Any], path: str) -> bool:
+    """The per-deliverable promotion gate.
+
+    True only when at least one constraint was genuinely checked and
+    every constraint applicable to ``path`` is PASS, and every
+    consistency item is PASS. Constraints that name a deliverable
+    apply to that deliverable; when none name it, the whole list
+    applies. An empty constraint set can never promote.
+    """
+    constraints = brief.get("constraints") or []
+    if not constraints:
+        return False
+    applicable = [c for c in constraints if c.get("deliverable") == path]
+    if not applicable:
+        applicable = list(constraints)
+    results = checks.get("constraints") or {}
+    for constraint in applicable:
+        entry = results.get(str(constraint.get("id")))
+        if entry is None or entry.get("status") != "PASS":
+            return False
+    for entry in (checks.get("consistency") or {}).values():
+        if entry.get("status") != "PASS":
             return False
     return True
 
@@ -576,8 +737,27 @@ class Verifier:
             path = item["path"] if isinstance(item, Mapping) else str(item)
             checks["deliverables"][path] = {
                 "exists": self.deliverable_exists(path)}
+        seen_ids: dict[str, int] = {}
         for constraint in brief.get("constraints") or []:
             cid = str(constraint.get("id"))
+            if cid in seen_ids:
+                # A duplicate id is rejected, never collapsed into the
+                # first entry: it is recorded under its own key as
+                # UNRESOLVED so it blocks any all-pass claim.
+                seen_ids[cid] += 1
+                dup_key = f"{cid}#dup{seen_ids[cid]}"
+                checks["constraints"][dup_key] = {
+                    "status": "UNRESOLVED",
+                    "hard": bool(constraint.get("hard")),
+                    "evidence": "duplicate constraint id rejected",
+                    "source_span": constraint.get("source_span"),
+                }
+                self.state.append_event(
+                    "constraint", id=dup_key, status="UNRESOLVED",
+                    hard=bool(constraint.get("hard")),
+                    source_span=constraint.get("source_span"))
+                continue
+            seen_ids[cid] = 0
             spec = constraint.get("check")
             if not isinstance(spec, Mapping):
                 status, evidence = "UNRESOLVED", "no check defined"
@@ -604,11 +784,42 @@ class Verifier:
                 status, evidence = "UNRESOLVED", "no check defined"
             checks["consistency"][str(item.get("id"))] = {
                 "status": status, "evidence": evidence}
+        checks["hard_failure_count"] = sum(
+            1 for entry in checks["constraints"].values()
+            if entry.get("hard") and entry.get("status") == "FAIL")
+        checks["hard_unresolved_count"] = sum(
+            1 for entry in checks["constraints"].values()
+            if entry.get("hard") and entry.get("status") == "UNRESOLVED")
         checks["all_hard_checks_pass"] = all_hard_checks_pass(checks)
         self.state.append_event(
             "checks", checks=checks,
             all_hard_checks_pass=checks["all_hard_checks_pass"])
         return checks
+
+
+def _run_acceptance(verifier: Verifier,
+                    item: Mapping[str, Any]) -> tuple[bool, bool, str]:
+    """Run a work item's acceptance check(s).
+
+    Returns (ran, passed, evidence). An item with no acceptance spec
+    has nothing to run; a spec (or list of specs) passes only when
+    every check is PASS.
+    """
+    spec = item.get("acceptance")
+    specs: list[Mapping[str, Any]] = []
+    if isinstance(spec, Mapping):
+        specs = [spec]
+    elif isinstance(spec, (list, tuple)):
+        specs = [s for s in spec if isinstance(s, Mapping)]
+    if not specs:
+        return (False, True, "no acceptance check defined")
+    evidence: list[str] = []
+    for one in specs:
+        status, why = verifier.run_check(one)
+        evidence.append(why)
+        if status != "PASS":
+            return (True, False, "; ".join(evidence))
+    return (True, True, "; ".join(evidence))
 
 
 # ---------------------------------------------------------------------
@@ -623,6 +834,31 @@ def _find_span(instruction: str, quote: str) -> Optional[dict[str, Any]]:
         return None
     return {"source": "instruction", "start": index,
             "end": index + len(quote), "quote": quote}
+
+
+def _validate_span(span: Any, instruction: str) -> Optional[dict[str, Any]]:
+    """Dereference a claimed source span against the instruction.
+
+    Returns a verified span dict, or None when the claim cannot be
+    found in the instruction text — an unverifiable span is no
+    provenance at all, and the constraint lands in UNRESOLVED.
+    """
+    if isinstance(span, str):
+        return _find_span(instruction, span)
+    if isinstance(span, Mapping):
+        quote = span.get("quote")
+        if isinstance(quote, str) and quote:
+            return _find_span(instruction, quote)
+        start, end = span.get("start"), span.get("end")
+        if (isinstance(start, int) and not isinstance(start, bool)
+                and isinstance(end, int) and not isinstance(end, bool)
+                and 0 <= start < end <= len(instruction)):
+            return {"source": "instruction", "start": start, "end": end,
+                    "quote": instruction[start:end]}
+        source = span.get("source")
+        if isinstance(source, str) and source and source != "instruction":
+            return _find_span(instruction, source)
+    return None
 
 
 def normalise_constraint(raw: Any, instruction: str,
@@ -643,8 +879,8 @@ def normalise_constraint(raw: Any, instruction: str,
         hard = True  # unclassified counts as hard
         classified = False
     span = raw.get("source_span") or raw.get("provenance") or raw.get("source")
-    if isinstance(span, str):
-        span = _find_span(instruction, span) or {"source": span}
+    if span is not None:
+        span = _validate_span(span, instruction)
     if span is None:
         span = _find_span(instruction, text)
     check = raw.get("check") if isinstance(raw.get("check"), Mapping) else None
@@ -672,6 +908,17 @@ def normalise_brief(raw: Any, task: Mapping[str, Any]) -> dict[str, Any]:
     constraints_raw = (task.get("constraints") or raw.get("constraints") or [])
     constraints = [normalise_constraint(c, instruction, i)
                    for i, c in enumerate(constraints_raw)]
+    seen_ids: dict[str, int] = {}
+    for constraint in constraints:
+        cid = constraint["id"]
+        if cid in seen_ids:
+            # Duplicate ids are rejected, never collapsed: the later
+            # entry keeps its own distinct key and is UNRESOLVED.
+            seen_ids[cid] += 1
+            constraint["id"] = f"{cid}#dup{seen_ids[cid]}"
+            constraint["status"] = "UNRESOLVED"
+        else:
+            seen_ids[cid] = 0
     work_items: list[dict[str, Any]] = []
     items_raw = (task.get("work_items") or raw.get("work_items")
                  or raw.get("plan") or [])
@@ -815,11 +1062,13 @@ def run_harness(task: Any, emit: Optional[Callable[[dict[str, Any]], Any]],
         call_fn = client
         client = _CallableClient(call_fn)
 
+    admission = int(cfg.get("worst_case_call_tokens") or estimated_call)
+
     def call_model(phase: str, messages: list[dict[str, Any]],
                    tool_defs: Optional[list] = None) -> Any:
         if not governor.can_call(phase):
             raise BudgetExceeded(f"{phase}: model-call reserve reached")
-        if not governor.can_spend(phase, estimated_call):
+        if not governor.can_spend(phase, admission):
             raise BudgetExceeded(f"{phase}: token allocation reached")
         governor.record_call(phase)
         try:
@@ -828,12 +1077,27 @@ def run_harness(task: Any, emit: Optional[Callable[[dict[str, Any]], Any]],
             response = exc.partial
             state.append_event("dead_end", text=f"interrupted call: {exc}")
         usage = getattr(response, "usage", None) or {}
-        counts, _ = normalize_usage(usage)
+        counts, defects = normalize_usage(usage)
+        for defect in getattr(response, "defects", None) or []:
+            if defect not in defects:
+                defects.append(defect)
         if not getattr(response, "usage_recorded", usage_recorded_by_client):
             state.append_usage({"phase": phase,
                                 "model": getattr(response, "model", None),
+                                "defects": defects,
                                 **counts})
-        governor.record_spend(phase, total_tokens(counts))
+        if not governor.record_spend(phase, total_tokens(counts)):
+            # The call's actuals broke the budget: the governor has
+            # charged only up to the protected ceilings and recorded
+            # the excess as an overrun. Honour the signal — the phase
+            # stops here instead of spending the reserve.
+            state.append_event(
+                "dead_end",
+                text=f"{phase}: call actuals exceeded the admission "
+                     "bound; overrun recorded, phase stopped")
+            raise BudgetExceeded(
+                f"{phase}: actual spend exceeded its allocation or "
+                "the protected reserve")
         return response
 
     outcome: dict[str, Any] = {"task_id": task_id, "status": "started",
@@ -907,9 +1171,46 @@ def run_harness(task: Any, emit: Optional[Callable[[dict[str, Any]], Any]],
         max_turns = int(cfg.get("max_turns", 50))
         turn = 0
         finish_requested = False
+        # Soft wall-clock transition: the task's time budget is read
+        # once; at the soft limit no new work starts and the run
+        # moves to verification and Finalize.
+        clock = cfg.get("clock") or time.monotonic
+        started = clock()
+        time_budget: Optional[float] = None
+        for key in ("agent_timeout_sec", "time_budget_sec", "timeout_sec"):
+            raw_budget = task.get(key) or cfg.get(key)
+            if raw_budget:
+                time_budget = float(raw_budget)
+                break
+        if cfg.get("soft_time_limit_sec"):
+            soft_limit: Optional[float] = float(cfg["soft_time_limit_sec"])
+        elif time_budget:
+            soft_limit = 0.8 * time_budget
+        else:
+            soft_limit = None
+        time_left_fn = cfg.get("time_left") if callable(
+            cfg.get("time_left")) else None
+        soft_transition = False
         while turn < max_turns and not finish_requested:
             turn += 1
             state.append_event("turn", turn=turn)
+            if soft_limit is not None:
+                elapsed_now = clock() - started
+                remaining = None
+                if time_left_fn is not None:
+                    remaining = time_left_fn()
+                elif time_budget:
+                    remaining = time_budget - elapsed_now
+                if elapsed_now >= soft_limit or (
+                        remaining is not None and time_budget
+                        and remaining <= time_budget - soft_limit):
+                    soft_transition = True
+                    state.append_event(
+                        "decision",
+                        text="soft wall-clock reached: no new work "
+                             "items start; moving to verification "
+                             "and Finalize")
+                    break
             hashes_before = _deliverable_hashes(store, brief)
             messages = _execute_messages(state, brief, observations,
                                          governor)
@@ -933,6 +1234,24 @@ def run_harness(task: Any, emit: Optional[Callable[[dict[str, Any]], Any]],
                 fp = fingerprint_call(name, args)
                 record = fingerprints.setdefault(
                     fp, {"count": 0, "result_class": None})
+                if record["count"] >= 3:
+                    # Repeat guard, checked BEFORE dispatch: the
+                    # predicted result class is the last recorded
+                    # class for this fingerprint, so an identical
+                    # repeat is blocked without executing — no side
+                    # effects, no spend on a call already made 3
+                    # times with the same outcome.
+                    observations.append(
+                        f"{name}: blocked — this exact call has already "
+                        f"been made 3 times with the same result "
+                        f"({record['result_class']}). It was not run.")
+                    state.append_event(
+                        "action", tool=name,
+                        target=str(args.get("path") or args.get("command")
+                                   or args.get("tool") or "")[:200],
+                        result_class="blocked",
+                        detail="repeat guard: blocked before dispatch")
+                    continue
                 result = tools.dispatch(name, args)
                 result_class = ("ok" if result.get("ok") else
                                 str(result.get("error_class") or "error"))
@@ -940,14 +1259,6 @@ def run_harness(task: Any, emit: Optional[Callable[[dict[str, Any]], Any]],
                 if hashlib.sha256(blob.encode()).hexdigest() not in seen_results:
                     seen_results.add(hashlib.sha256(blob.encode()).hexdigest())
                     new_info = True
-                if record["count"] >= 3 and record["result_class"] == result_class:
-                    observations.append(
-                        f"{name}: blocked — this exact call has already "
-                        f"been made 3 times with the same result.")
-                    state.append_event(
-                        "action", tool=name, target=str(args)[:200],
-                        result_class="blocked", detail="repeat guard")
-                    continue
                 record["count"] += 1
                 record["result_class"] = result_class
                 state.append_event(
@@ -963,9 +1274,35 @@ def run_harness(task: Any, emit: Optional[Callable[[dict[str, Any]], Any]],
                     if any(d["path"] == written for d in brief["deliverables"]):
                         store.sync_from_graded(written)
                         for item in brief["work_items"]:
-                            if item.get("deliverable") == written:
+                            if item.get("deliverable") != written:
+                                continue
+                            if item["status"] == "complete":
+                                continue
+                            ran, passed, evidence = _run_acceptance(
+                                verifier, item)
+                            if ran and not passed:
+                                # Acceptance runs as soon as the item
+                                # is marked done, not at the end: a
+                                # failure reopens the item while
+                                # Execute budget remains to repair it.
+                                item["status"] = "pending"
+                                state.append_event(
+                                    "work_item", id=item["id"],
+                                    status="pending",
+                                    reason=f"acceptance failed: {evidence}",
+                                    acceptance_status="FAIL")
+                                observations.append(
+                                    f"work item {item['id']}: acceptance "
+                                    f"check failed ({evidence}); the "
+                                    "item is reopened.")
+                            else:
                                 item["status"] = "complete"
                                 store.mark_complete(written)
+                                if ran:
+                                    state.append_event(
+                                        "work_item", id=item["id"],
+                                        status="complete",
+                                        acceptance_status="PASS")
             hashes_after = _deliverable_hashes(store, brief)
             if hashes_after == hashes_before and not new_info:
                 no_progress += 1
@@ -1023,23 +1360,38 @@ def run_harness(task: Any, emit: Optional[Callable[[dict[str, Any]], Any]],
             except BudgetExceeded:
                 pass
             except Exception as exc:
+                if _is_session_cancelled(exc):
+                    raise
                 state.append_event("dead_end", text=f"audit call failed: {exc}")
         checks = verifier.verify(brief)
         for entry in brief["deliverables"]:
             path = entry["path"]
             exists = (checks["deliverables"].get(path) or {}).get("exists")
-            if exists and checks["all_hard_checks_pass"]:
+            if exists and deliverable_checks_pass(checks, brief, path):
                 store.promote(path)
             elif exists and store.verified_copy(path) is not None:
+                # Per-path restore: only a deliverable whose own
+                # checks fail is restored, and the discarded bytes
+                # are noted in the record.
                 current = store.read_graded(path)
                 verified = store.verified_copy(path)
                 if current != verified:
+                    state.append_event(
+                        "decision",
+                        text=f"restored {path} from the last verified "
+                             "copy; discarded bytes that failed this "
+                             "deliverable's own checks (sha256 "
+                             f"{hashlib.sha256(current or b'').hexdigest()[:12]})")
                     store.restore_verified(path)
         state.persist()
         outcome.update({
             "status": "finalized",
             "checks": checks,
             "all_hard_checks_pass": checks["all_hard_checks_pass"],
+            "hard_failure_count": checks.get("hard_failure_count", 0),
+            "hard_unresolved_count": checks.get("hard_unresolved_count", 0),
+            "wall_time_sec": clock() - started,
+            "soft_time_transition": soft_transition,
             "deliverables": copy.deepcopy(state.summary["deliverables"]),
             "usage": dict(state.summary["usage"]),
             "budget": governor.snapshot(),
@@ -1050,6 +1402,8 @@ def run_harness(task: Any, emit: Optional[Callable[[dict[str, Any]], Any]],
         _write_closing_summary(state, state_dir)
         return outcome
     except Exception as exc:  # the supervisor owns the closing frame
+        if _is_session_cancelled(exc):
+            raise
         state.append_event("dead_end",
                            text=f"loop failure: {type(exc).__name__}: {exc}")
         try:
@@ -1057,11 +1411,16 @@ def run_harness(task: Any, emit: Optional[Callable[[dict[str, Any]], Any]],
         except Exception:
             pass
         _write_closing_summary(state, state_dir)
+        try:
+            final_message = state.closing_summary_text()
+        except Exception:
+            final_message = (f"Task {task_id}: closing summary "
+                             "unavailable; see the run record.")
         outcome.update({
             "status": "error_outcome",
             "error": f"{type(exc).__name__}: {exc}",
             "state_dir": str(state_dir),
-            "final_message": state.closing_summary_text(),
+            "final_message": final_message,
         })
         return outcome
 
@@ -1077,12 +1436,13 @@ class _CallableClient:
         result = self._fn(messages, tools=tools, phase=phase)
         if isinstance(result, Mapping):
             from model_client import ModelResponse
-            usage, _ = normalize_usage(result.get("usage"))
+            usage, defects = normalize_usage(result.get("usage"))
             return ModelResponse(
                 content=str(result.get("content") or ""),
                 tool_calls=list(result.get("tool_calls") or []),
                 usage=usage, model=str(result.get("model") or ""),
-                usage_recorded=bool(result.get("usage_recorded", False)))
+                usage_recorded=bool(result.get("usage_recorded", False)),
+                defects=defects)
         return result
 
 

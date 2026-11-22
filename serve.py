@@ -35,8 +35,13 @@ the semantics below.
 - config: a dict with `session`, `state_dir`, `limits`,
   `mcp_servers`, `deadline` (a monotonic timestamp or None),
   `cancel_event` and `finalize_event` (asyncio events the loop may
-  poll: cancel means stop now, finalize means wrap up), and
-  `time_left()` returning seconds remaining or None.
+  poll: cancel means stop now, finalize means wrap up),
+  `cancel_flag` and `finalize_flag` (threading events mirroring
+  them, safe to poll from the loop's worker thread), `time_left()`
+  returning seconds remaining or None, and `emit_is_transport` set
+  true: the loop's tool dispatcher takes its request transport from
+  the emit callable itself, so tool calls flow through this session
+  as request frames instead of running locally.
 
 run_harness returns an outcome dict, translated by the supervisor
 into the session's single terminal frame:
@@ -73,6 +78,7 @@ import math
 import os
 import re
 import sys
+import threading
 import time
 import urllib.parse
 from typing import Any
@@ -309,6 +315,18 @@ class Serialiser:
         """Returns the wire-ready frame, or raises FrameError."""
         if not isinstance(frame, dict):
             raise FrameError("a frame is one JSON object")
+        if frame.get("type") in REQUESTS:
+            # A NUL in a field the evaluator acts on (command, path,
+            # url) is refused, not stripped: deleting the byte would
+            # silently join the two halves into a request the caller
+            # never literally wrote. Stripping still applies to log,
+            # final, and error text, where it cannot change what is
+            # executed or read. Checked on the raw frame, before
+            # sanitising removes the evidence.
+            for key in ("command", "path", "url"):
+                value = frame.get(key)
+                if isinstance(value, str) and "\x00" in value:
+                    raise FrameError(f"{key}: contains a NUL byte")
         frame = _sanitise(frame)
         kind = frame.get("type")
         if kind in ENDS:
@@ -404,9 +422,10 @@ class Serialiser:
         """
         clean = self._prepare(frame)
         payload = json.dumps(clean)
-        if len(payload) > MAX_FRAME_BYTES:
+        size = len(payload.encode("utf-8"))
+        if size > MAX_FRAME_BYTES:
             raise FrameTooLarge(
-                f"{clean.get('type')}: the frame is {len(payload)} bytes, over"
+                f"{clean.get('type')}: the frame is {size} bytes, over"
                 f" the protocol's {MAX_FRAME_BYTES >> 20} MiB"
             )
         async with self._lock:
@@ -426,11 +445,25 @@ class Serialiser:
         cap = FINAL_MESSAGE_CAP if kind == "done" else ERROR_MESSAGE_CAP
         body = _clean_text(text if isinstance(text, str) else str(text))[:cap]
         payload = json.dumps({"type": kind, field: body})
-        while len(payload) > MAX_FRAME_BYTES:  # unreachable under the caps
+        while len(payload.encode("utf-8")) > MAX_FRAME_BYTES:
+            # unreachable under the caps
             body = body[: len(body) // 2]
             payload = json.dumps({"type": kind, field: body})
         async with self._lock:
-            await self._send_raw(payload)
+            try:
+                await self._send_raw(payload)
+            except Exception:
+                # One fallback attempt: a failed send must not
+                # silently consume the session's only terminal
+                # frame. If the fallback fails too, the claim is
+                # released so a later closing path can retry, and
+                # the failure propagates to the caller.
+                try:
+                    await self._send_raw(payload)
+                except Exception:
+                    self._terminal_claimed = False
+                    self.note_defect("terminal send failed twice; claim released")
+                    raise
         return True
 
 
@@ -520,6 +553,11 @@ class Session:
         self.state_dir: str | None = None
         self.cancel_event = asyncio.Event()
         self.finalize_event = asyncio.Event()
+        # Threading mirrors of the two signals: the loop and the
+        # model client run in a worker thread, where polling an
+        # asyncio event is not safe; these are set alongside them.
+        self._cancel_flag = threading.Event()
+        self._finalize_flag = threading.Event()
         self._self_done = asyncio.Event()
         self._ended = asyncio.Event()
         self._pending: dict[str, asyncio.Future] = {}
@@ -553,6 +591,11 @@ class Session:
             if self.cancel_event.is_set():
                 raise SessionCancelled("cancelled: no new requests")
             async with self._inflight:
+                # Re-check after acquiring the semaphore: a request
+                # that waited for a slot while a cancel landed must
+                # not be sent once the slot frees.
+                if self.cancel_event.is_set() or self._ended.is_set():
+                    raise SessionCancelled("cancelled: no new requests")
                 return await self._request(frame)
         await self.serialiser.send(frame)
         return None
@@ -633,6 +676,7 @@ class Session:
     def _on_cancel(self) -> None:
         if not self.cancel_event.is_set():
             self.cancel_event.set()
+            self._cancel_flag.set()
             self._fail_pending()
 
     async def _reader(self) -> None:
@@ -700,6 +744,7 @@ class Session:
         if delay > 0:
             await asyncio.sleep(delay)
         self.finalize_event.set()
+        self._finalize_flag.set()
         delay = done_at - time.monotonic()
         if delay > 0:
             await asyncio.sleep(delay)
@@ -716,7 +761,16 @@ class Session:
             "deadline": self.deadline,
             "cancel_event": self.cancel_event,
             "finalize_event": self.finalize_event,
+            "cancel_flag": self._cancel_flag,
+            "finalize_flag": self._finalize_flag,
             "time_left": self.time_left,
+            # The production tool transport: the dispatcher resolves
+            # its request callable from the emit it is handed (the
+            # harness reads `request`/`transport` first, then this
+            # flag), so exec/read_file/write_file go out as request
+            # frames through the serialiser and mcp_call rides the
+            # http request type — nothing runs locally.
+            "emit_is_transport": True,
         }
 
     async def _run_loop(self) -> Any:
@@ -872,15 +926,31 @@ class Session:
 
     # -- session entry ----------------------------------------------------
 
+    @staticmethod
+    def _safe_dir_name(session_id: str) -> str:
+        """A session id reduced to one safe path component.
+
+        Anything outside [A-Za-z0-9_-] collapses to an underscore, so
+        separators and dot runs from an arbitrary id cannot traverse
+        out of the state root.
+        """
+        name = re.sub(r"[^A-Za-z0-9_-]+", "_", session_id).strip("._")
+        return name or "session"
+
     def _open_state_dir(self, session_id: str) -> None:
         root = self._base_config.get("state_root") or os.path.join(
             os.environ.get("HOME") or ".", "state"
         )
-        path = os.path.join(root, session_id)
+        path = os.path.join(root, self._safe_dir_name(session_id))
         try:
+            if os.path.commonpath(
+                [os.path.abspath(path), os.path.abspath(root)]
+            ) != os.path.abspath(root):
+                self.state_dir = None
+                return
             os.makedirs(path, exist_ok=True)
             self.state_dir = path
-        except OSError:
+        except (OSError, ValueError):
             self.state_dir = None
 
     async def run(self) -> None:

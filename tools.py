@@ -15,13 +15,25 @@ Contracts worth knowing:
   every chunk result is checked against it, a chunk whose response is
   lost is probed by file size (never blindly re-sent), and the final
   size and hash are read back and compared before the write counts as
-  done.
+  done. A size probe that cannot answer never waives verification:
+  an unverifiable write is an integrity failure, not a pass. File
+  content is written exactly as supplied; the line-number prefixes
+  added by ``read_file`` are stripped only when the caller explicitly
+  passes ``strip_line_numbers=True``.
+- All tool paths are confined to the workdir: paths are normalised
+  against it, absolute paths and ``..`` escapes are rejected, and
+  symlinks are resolved so a target outside the workdir is rejected
+  on both the local and the evaluator transport.
 - ``exec`` runs each command in a fresh ``bash`` subshell in the
   workdir: files persist, ``cd`` and exports do not. The timeout is
-  capped at 600 s. Background execution is explicit: a background job
-  starts in its own new process group (``setsid``), its output goes to
-  a log file, and it is stopped by signalling the process group, never
-  by guessing at individual process ids.
+  capped at 600 s and, when a task deadline is supplied, at the
+  remaining task time. A foreground command runs in its own process
+  group, and the whole group is killed when the call returns or times
+  out. Background execution is explicit: a background job starts in
+  its own new process group (``setsid``), its output goes to a log
+  file, finished jobs are reaped, and jobs are stopped by signalling
+  their process group (SIGTERM, then SIGKILL), never by guessing at
+  individual process ids.
 - ``mcp_call`` goes through the MCP layer in this module: sessions are
   initialised lazily, a dropped session is re-initialised, and a
   mutating call whose response is lost is probed for its effect
@@ -47,12 +59,18 @@ DEFAULT_CHUNK_BYTES = 5_000_000
 MAX_EXEC_TIMEOUT_SEC = 600
 DEFAULT_EXEC_TIMEOUT_SEC = 120
 RESULT_SUMMARY_CHARS = 2_000
+MAX_EXEC_OUTPUT_CHARS = 100_000
+MAX_READ_BYTES = 10_000_000
 
 TOOL_NAMES = ("read_file", "write_file", "exec", "mcp_call")
 
 _MUTATING_HINTS = ("create", "update", "delete", "write", "send", "set",
                    "add", "remove", "move", "assign", "post", "put",
-                   "insert", "submit", "approve", "publish")
+                   "patch", "insert", "submit", "approve", "publish",
+                   "archive", "rename", "transfer", "apply", "pay",
+                   "close", "execute", "duplicate", "destroy", "drop",
+                   "edit", "modify", "upload", "import", "replace",
+                   "merge", "cancel", "refund", "charge", "book")
 
 
 class ToolError(Exception):
@@ -69,6 +87,14 @@ class MCPError(ToolError):
 
 class MCPAmbiguousResult(MCPError):
     """A mutating call's outcome is unknown and no probe exists."""
+
+
+class MCPTransportLost(MCPError):
+    """The transport reported the request or its response as lost."""
+
+
+class MCPSessionExpired(MCPError):
+    """The server says the MCP session is gone and must be reopened."""
 
 
 def _result(ok: bool, summary: str, data: Any = None,
@@ -136,7 +162,8 @@ def tool_schemas() -> list[dict[str, Any]]:
            "authored chunk by chunk.",
            {"path": {"type": "string"},
             "content": {"type": "string"},
-            "append": {"type": "boolean"}},
+            "append": {"type": "boolean"},
+            "strip_line_numbers": {"type": "boolean"}},
            ["path", "content"]),
         fn("exec",
            "Run a bash command in the workdir. Each call is a fresh "
@@ -282,7 +309,11 @@ class MCPLayer:
         result = self.http_request(frame)
         if not isinstance(result, Mapping) or not result.get("ok", True):
             error = result.get("error") if isinstance(result, Mapping) else None
-            raise MCPError(f"MCP request failed: {error or 'no result'}")
+            # On the evaluator path a not-ok result is how a lost
+            # request/response is reported; classify it structurally
+            # so callers can apply the recovery rules to it.
+            raise MCPTransportLost(
+                f"MCP request failed: {error or 'no result'}")
         raw = base64.b64decode(result.get("body_b64") or "")
         out_headers = {str(k): str(v)
                        for k, v in (result.get("headers") or {}).items()}
@@ -336,11 +367,17 @@ class MCPLayer:
         if notify:
             return {}
         if status >= 400:
-            raise MCPError(f"{method}: HTTP {status}: {str(body)[:200]}")
+            detail = f"{method}: HTTP {status}: {str(body)[:200]}"
+            if status in (404, 410) or self._session_expired_text(body):
+                raise MCPSessionExpired(detail)
+            raise MCPError(detail)
         for message in self._messages(body):
             if message.get("id") == rid:
                 if "error" in message:
-                    raise MCPError(f"{method}: {message['error']}")
+                    detail = f"{method}: {message['error']}"
+                    if self._session_expired_text(message["error"]):
+                        raise MCPSessionExpired(detail)
+                    raise MCPError(detail)
                 result = message.get("result")
                 return result if isinstance(result, dict) else {}
         raise MCPError(f"{method}: no answer for id {rid}")
@@ -389,19 +426,29 @@ class MCPLayer:
 
     def is_mutating(self, tool: str,
                     explicit: Optional[bool] = None) -> bool:
-        if explicit is not None:
-            return bool(explicit)
+        """Classify a tool as mutating. The classification is a floor:
+        the configured set and the name heuristic always apply, and an
+        explicit caller-supplied flag may only raise the caution
+        (``True``), never lower it."""
+        if explicit:
+            return True
         if tool in self.mutating_tools:
             return True
         lowered = tool.lower()
         return any(hint in lowered for hint in _MUTATING_HINTS)
 
     @staticmethod
-    def _session_expired(exc: Exception) -> bool:
-        text = str(exc).lower()
+    def _session_expired_text(value: Any) -> bool:
+        text = str(value).lower()
         return "session" in text and any(
             word in text for word in ("expired", "invalid", "not found",
-                                      "missing", "unknown", "404"))
+                                      "missing", "unknown", "404", "gone",
+                                      "no longer"))
+
+    @classmethod
+    def _session_expired(cls, exc: Exception) -> bool:
+        return isinstance(exc, MCPSessionExpired) or \
+            cls._session_expired_text(exc)
 
     def _probe(self, server: str, tool: str,
                args: Mapping[str, Any]) -> Optional[bool]:
@@ -429,7 +476,13 @@ class MCPLayer:
             return self._rpc(server, "tools/call",
                              {"name": tool, "arguments": arguments})
         except Exception as exc:
-            lost = isinstance(exc, (ConnectionError, TimeoutError, OSError))
+            # Recovery is driven by the failure's shape, not only its
+            # type: the evaluator path reports lost responses and dead
+            # sessions as MCPTransportLost / MCPSessionExpired raised
+            # at the _send/_rpc boundary, alongside the raw connection
+            # errors a direct transport produces.
+            lost = isinstance(exc, (ConnectionError, TimeoutError, OSError,
+                                    MCPTransportLost))
             expired = self._session_expired(exc)
             if not (lost or expired):
                 raise MCPError(f"tools/call {tool}: {exc}") from exc
@@ -444,8 +497,22 @@ class MCPLayer:
                         "probe is available; not retried") from exc
             self.reset(server)
             self.initialize(server)
-            return self._rpc(server, "tools/call",
-                             {"name": tool, "arguments": arguments})
+            try:
+                return self._rpc(server, "tools/call",
+                                 {"name": tool, "arguments": arguments})
+            except Exception as retry_exc:
+                retry_lost = isinstance(
+                    retry_exc, (ConnectionError, TimeoutError, OSError,
+                                MCPTransportLost)) or \
+                    self._session_expired(retry_exc)
+                if retry_lost and is_mut:
+                    raise MCPAmbiguousResult(
+                        f"tools/call {tool}: retry response lost; outcome "
+                        "unknown and not retried again") from retry_exc
+                if isinstance(retry_exc, MCPError):
+                    raise
+                raise MCPError(
+                    f"tools/call {tool}: {retry_exc}") from retry_exc
 
 
 # ---------------------------------------------------------------------
@@ -467,6 +534,9 @@ class ToolDispatcher:
         self.chunk_bytes = max(1, min(self.chunk_bytes, MAX_WRITE_BYTES))
         self.readback_limit = int(cfg.get("integrity_readback_limit",
                                           MAX_WRITE_BYTES))
+        self.max_read_bytes = int(cfg.get("max_read_bytes", MAX_READ_BYTES))
+        self.max_exec_output_chars = int(cfg.get(
+            "max_exec_output_chars", MAX_EXEC_OUTPUT_CHARS))
         self.bg_dir = Path(cfg.get("background_dir",
                                    self.workdir / ".ple-background"))
         self._background: dict[int, subprocess.Popen] = {}
@@ -484,9 +554,37 @@ class ToolDispatcher:
 
     # -- transport -------------------------------------------------------
 
+    def _confined_rel(self, path: str) -> str:
+        """Normalise ``path`` against the workdir and return the
+        workdir-relative path, rejecting anything that escapes.
+
+        Absolute paths are rejected outright; the remainder is fully
+        resolved (``..`` segments and symlinks included) and must land
+        strictly inside the workdir."""
+        raw = Path(str(path))
+        if raw.is_absolute():
+            raise ToolError(f"path escapes the workdir: {path}")
+        if not str(path).strip() or str(path).strip() == ".":
+            raise ToolError("path must name a file inside the workdir")
+        root = Path(self.workdir).resolve()
+        resolved = (root / raw).resolve()
+        if resolved == root or root not in resolved.parents:
+            raise ToolError(f"path escapes the workdir: {path}")
+        return resolved.relative_to(root).as_posix()
+
     def _resolve(self, path: str) -> Path:
-        candidate = Path(path)
-        return candidate if candidate.is_absolute() else self.workdir / candidate
+        return Path(self.workdir).resolve() / self._confined_rel(path)
+
+    def _truncate_output(self, text: str) -> tuple[str, bool]:
+        """Cap combined exec output, keeping head and tail."""
+        cap = self.max_exec_output_chars
+        if cap <= 0 or len(text) <= cap:
+            return text, False
+        marker = "\n...[output truncated]...\n"
+        keep = max(0, cap - len(marker))
+        head = keep // 2
+        tail = keep - head
+        return text[:head] + marker + (text[-tail:] if tail else ""), True
 
     def _request(self, frame: dict[str, Any]) -> dict[str, Any]:
         if self.request is None:
@@ -502,6 +600,10 @@ class ToolDispatcher:
             path = self._resolve(str(frame.get("path", "")))
             if not path.is_file():
                 return {"ok": False, "error": f"not a regular file: {path}"}
+            size = path.stat().st_size
+            if size > self.max_read_bytes:
+                return {"ok": True, "size": size, "content_b64": "",
+                        "truncated": True}
             data = path.read_bytes()
             return {"ok": True, "size": len(data),
                     "content_b64": base64.b64encode(data).decode(),
@@ -540,36 +642,63 @@ class ToolDispatcher:
             ["bash", "-c", command], cwd=str(self.workdir),
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             start_new_session=True)
+        pgid = os.getpgid(proc.pid)
         try:
             out, _ = proc.communicate(timeout=timeout_sec)
-            return {"ok": True, "exit_code": proc.returncode,
-                    "output": out.decode("utf-8", "replace"),
-                    "timed_out": False, "truncated": False}
+            timed_out = False
+            exit_code = proc.returncode
         except subprocess.TimeoutExpired:
+            timed_out = True
+            exit_code = 124
+            out, _ = b"", None
+        finally:
+            # The command ran in its own process group; kill the whole
+            # group on timeout and on return alike, so children the
+            # command started (and did not itself detach with setsid)
+            # cannot outlive the call.
             try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                os.killpg(pgid, signal.SIGKILL)
             except (ProcessLookupError, PermissionError):
-                proc.kill()
-            out, _ = proc.communicate()
-            return {"ok": True, "exit_code": 124,
-                    "output": out.decode("utf-8", "replace"),
-                    "timed_out": True, "truncated": False}
+                pass
+            if timed_out:
+                out, _ = proc.communicate()
+        text, truncated = self._truncate_output(
+            out.decode("utf-8", "replace"))
+        return {"ok": True, "exit_code": exit_code, "output": text,
+                "timed_out": timed_out, "truncated": truncated}
 
     # -- read --------------------------------------------------------------
 
     def read_bytes(self, path: str) -> tuple[bytes, dict[str, Any]]:
-        result = self._request({"type": "read_file", "path": path})
+        rel = self._confined_rel(path)
+        result = self._request({"type": "read_file", "path": rel})
         if not result.get("ok"):
             raise ToolError(f"read_file {path}: {result.get('error') or 'failed'}")
         if result.get("truncated"):
             raise ToolError(f"read_file {path}: file exceeds one read")
+        size = result.get("size")
+        if isinstance(size, int) and size > self.max_read_bytes:
+            raise ToolError(
+                f"read_file {path}: file exceeds the "
+                f"{self.max_read_bytes}-byte read bound")
         data = base64.b64decode(result.get("content_b64") or "")
+        if len(data) > self.max_read_bytes:
+            raise ToolError(
+                f"read_file {path}: file exceeds the "
+                f"{self.max_read_bytes}-byte read bound")
         return data, {"size": int(result.get("size", len(data)))}
 
     def probe_size(self, path: str) -> Optional[int]:
         """Best-effort current size of ``path``; None when unknown."""
         try:
-            result = self._request({"type": "read_file", "path": path})
+            rel = self._confined_rel(path)
+        except ToolError:
+            return None
+        return self._probe_size_rel(rel)
+
+    def _probe_size_rel(self, rel: str) -> Optional[int]:
+        try:
+            result = self._request({"type": "read_file", "path": rel})
         except Exception:
             return None
         if isinstance(result.get("size"), int):
@@ -610,10 +739,15 @@ class ToolDispatcher:
         if not isinstance(data, (bytes, bytearray)):
             raise ToolError("write_file: data must be bytes")
         payload = bytes(data)
+        rel = self._confined_rel(path)
         current = 0
         if append:
-            probed = self.probe_size(path)
-            current = probed if probed is not None else 0
+            probed = self._probe_size_rel(rel)
+            if probed is None:
+                raise IntegrityError(
+                    f"write_file {path}: cannot verify the current size "
+                    "before appending; refusing to write unverified")
+            current = probed
         chunks = [payload[i:i + self.chunk_bytes]
                   for i in range(0, len(payload), self.chunk_bytes)] or [b""]
         sent = 0
@@ -625,7 +759,7 @@ class ToolDispatcher:
             if not append and index == 0:
                 expected_after = len(chunk)
             before_chunk = expected_after - len(chunk)
-            frame = {"type": "write_file", "path": path, "append": use_append,
+            frame = {"type": "write_file", "path": rel, "append": use_append,
                      "content_b64": base64.b64encode(chunk).decode()}
             try:
                 result = self._request(frame)
@@ -643,20 +777,38 @@ class ToolDispatcher:
                 # The response may be lost after the write landed. Probe
                 # by size: landed -> continue; not landed -> resend once;
                 # anything else -> the file state is uncertain.
-                probed = self.probe_size(path)
+                probed = self._probe_size_rel(rel)
                 if probed == expected_after:
                     pass
                 elif probed == before_chunk:
-                    result = self._request(frame)
-                    if not result.get("ok"):
-                        raise ToolError(
-                            f"write_file {path}: {result.get('error') or 'failed'}"
-                        ) from exc
-                    reported = result.get("size")
-                    if isinstance(reported, int) and reported != expected_after:
-                        raise IntegrityError(
-                            f"write_file {path}: resent chunk reported size "
-                            f"{reported}, expected {expected_after}") from exc
+                    # The resend gets the same probe protection as the
+                    # first send: if its response is lost too, probe
+                    # again and report the outcome as an integrity
+                    # result, never as a raw transport error.
+                    try:
+                        result = self._request(frame)
+                    except Exception as resend_exc:
+                        reprobed = self._probe_size_rel(rel)
+                        if reprobed == expected_after:
+                            result = None
+                        else:
+                            raise IntegrityError(
+                                f"write_file {path}: resent chunk {index} "
+                                f"outcome unknown (probed size {reprobed}, "
+                                f"expected {expected_after})") from resend_exc
+                    if result is not None:
+                        if not result.get("ok"):
+                            raise ToolError(
+                                f"write_file {path}: "
+                                f"{result.get('error') or 'failed'}"
+                            ) from exc
+                        reported = result.get("size")
+                        if isinstance(reported, int) and \
+                                reported != expected_after:
+                            raise IntegrityError(
+                                f"write_file {path}: resent chunk reported "
+                                f"size {reported}, expected {expected_after}"
+                            ) from exc
                 else:
                     raise IntegrityError(
                         f"write_file {path}: chunk {index} outcome unknown "
@@ -664,8 +816,12 @@ class ToolDispatcher:
                     ) from exc
             sent += len(chunk)
         final_size = (current + len(payload)) if append else len(payload)
-        probed = self.probe_size(path)
-        if probed is not None and probed != final_size:
+        probed = self._probe_size_rel(rel)
+        if probed is None:
+            raise IntegrityError(
+                f"write_file {path}: final size could not be verified "
+                f"(expected {final_size}); the write is not confirmed")
+        if probed != final_size:
             raise IntegrityError(
                 f"write_file {path}: final size {probed}, expected {final_size}")
         digest = hashlib.sha256(payload).hexdigest()
@@ -680,9 +836,15 @@ class ToolDispatcher:
                 "chunks": len(chunks), "append": append}
 
     def write_file(self, path: str, content: Any,
-                   append: bool = False) -> dict[str, Any]:
+                   append: bool = False,
+                   strip_line_numbers: bool = False) -> dict[str, Any]:
         if isinstance(content, str):
-            content = strip_line_number_prefixes(content)
+            # Content is written exactly as supplied. Stripping the
+            # read_file line-number prefixes is strictly opt-in: by
+            # default a numbered document (a TSV whose first column is
+            # numbers, say) round-trips byte-identical.
+            if strip_line_numbers:
+                content = strip_line_number_prefixes(content)
             data = content.encode("utf-8")
         elif isinstance(content, (bytes, bytearray)):
             data = bytes(content)
@@ -697,11 +859,41 @@ class ToolDispatcher:
 
     # -- exec ------------------------------------------------------------------
 
+    def _remaining_timeout(self, deadline: Optional[float]) -> Optional[int]:
+        """Seconds of task time left (minus a safety margin), or None
+        when no deadline is known."""
+        remaining: Optional[float] = None
+        if deadline is not None:
+            remaining = float(deadline) - time.time()
+        else:
+            cfg_deadline = self.config.get("deadline")
+            if isinstance(cfg_deadline, (int, float)):
+                remaining = float(cfg_deadline) - time.time()
+            else:
+                time_left = self.config.get("time_left")
+                if callable(time_left):
+                    try:
+                        value = time_left()
+                    except Exception:
+                        value = None
+                    if isinstance(value, (int, float)):
+                        remaining = float(value)
+        if remaining is None:
+            return None
+        return int(remaining - 2)
+
     def exec(self, command: str, timeout_s: int = DEFAULT_EXEC_TIMEOUT_SEC,
-             background: bool = False) -> dict[str, Any]:
+             background: bool = False,
+             deadline: Optional[float] = None) -> dict[str, Any]:
         if not isinstance(command, str) or not command:
             raise ToolError("exec: command must be non-empty text")
         timeout = max(1, min(int(timeout_s), MAX_EXEC_TIMEOUT_SEC))
+        remaining = self._remaining_timeout(deadline)
+        if remaining is not None:
+            if remaining <= 0:
+                raise ToolError("exec: no task time remaining")
+            timeout = max(1, min(timeout, remaining))
+        self.reap_background()
         if background and self.request is None:
             result = self._local_exec(command, timeout, True)
             return _result(True, f"background job started (pid {result['pid']}, "
@@ -729,25 +921,78 @@ class ToolDispatcher:
         if not result.get("ok", True):
             raise ToolError(f"exec: {result.get('error') or 'failed'}")
         exit_code = result.get("exit_code")
+        output, capped = self._truncate_output(str(result.get("output", "")))
+        truncated = bool(result.get("truncated")) or capped
         # A command that ran is a successful call whatever its exit
         # code; the code itself is part of the result data.
         return _result(
             True,
             f"exit code {exit_code}" + (" (timed out)"
                                         if result.get("timed_out") else ""),
-            {"exit_code": exit_code, "output": result.get("output", ""),
+            {"exit_code": exit_code, "output": output,
              "timed_out": bool(result.get("timed_out")),
-             "truncated": bool(result.get("truncated"))},
-            truncated=bool(result.get("truncated")))
+             "truncated": truncated},
+            truncated=truncated)
+
+    # -- background job lifecycle -----------------------------------------
+
+    def reap_background(self) -> list[int]:
+        """Reap tracked background jobs that have finished, so exited
+        jobs do not linger as zombies. Returns their pids."""
+        finished: list[int] = []
+        for pid, proc in list(self._background.items()):
+            if proc.poll() is not None:
+                finished.append(pid)
+                del self._background[pid]
+        return finished
 
     def stop_background(self, pid: int) -> bool:
-        """Stop a local background job by its process group."""
-        proc = self._background.pop(int(pid), None)
-        try:
-            os.killpg(os.getpgid(int(pid)), signal.SIGTERM)
+        """Stop a registered local background job: SIGTERM its process
+        group, then SIGKILL if it has not exited. Only jobs this
+        dispatcher started are ever signalled. Returns True only when
+        the job is actually finished afterwards."""
+        proc = self._background.get(int(pid))
+        if proc is None:
+            return False
+        if proc.poll() is not None:
+            del self._background[int(pid)]
             return True
+        try:
+            pgid = os.getpgid(proc.pid)
         except (ProcessLookupError, PermissionError):
-            return proc is not None
+            pgid = None
+        if pgid is not None:
+            try:
+                os.killpg(pgid, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            if pgid is not None:
+                try:
+                    os.killpg(pgid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+        done = proc.poll() is not None
+        if done:
+            del self._background[int(pid)]
+        return done
+
+    def stop_all_background(self) -> int:
+        """Stop every registered background job. The harness calls
+        this before finishing so no started job outlives the task.
+        Returns how many jobs were stopped."""
+        self.reap_background()
+        stopped = 0
+        for pid in list(self._background):
+            if self.stop_background(pid):
+                stopped += 1
+        return stopped
 
     # -- mcp -------------------------------------------------------------------
 
@@ -761,7 +1006,8 @@ class ToolDispatcher:
 
     def dispatch(self, name: str,
                  arguments: Optional[Mapping[str, Any]] = None) -> dict[str, Any]:
-        """Validate and run one model-proposed call. Never raises."""
+        """Validate and run one model-proposed call. Never raises,
+        except that a session cancellation always propagates."""
         args = dict(arguments or {})
         try:
             if name == "read_file":
@@ -769,14 +1015,21 @@ class ToolDispatcher:
                                       int(args.get("offset") or 0),
                                       args.get("limit"))
             if name == "write_file":
-                return self.write_file(str(args["path"]), args.get("content"),
-                                       bool(args.get("append", False)))
+                return self.write_file(
+                    str(args["path"]), args.get("content"),
+                    bool(args.get("append", False)),
+                    strip_line_numbers=bool(
+                        args.get("strip_line_numbers", False)))
             if name == "exec":
-                return self.exec(str(args["command"]),
-                                 int(args.get("timeout_s")
-                                     or args.get("timeout_sec")
-                                     or DEFAULT_EXEC_TIMEOUT_SEC),
-                                 bool(args.get("background", False)))
+                deadline = args.get("deadline")
+                return self.exec(
+                    str(args["command"]),
+                    int(args.get("timeout_s")
+                        or args.get("timeout_sec")
+                        or DEFAULT_EXEC_TIMEOUT_SEC),
+                    bool(args.get("background", False)),
+                    deadline=float(deadline)
+                    if isinstance(deadline, (int, float)) else None)
             if name == "mcp_call":
                 return self.mcp_call(str(args["server"]), str(args["tool"]),
                                      args.get("args") or {},
@@ -793,5 +1046,11 @@ class ToolDispatcher:
         except (ToolError, MCPError) as exc:
             return _result(False, str(exc), error_class="tool_error")
         except Exception as exc:  # surfaced to the model, never raised
+            # Cancellation is not an error observation: a cancelled
+            # session must unwind, not hand the loop a result to act
+            # on. serve.py's SessionCancelled is recognised by class
+            # name so this module needs no import of the server.
+            if type(exc).__name__ == "SessionCancelled":
+                raise
             return _result(False, f"{name}: {type(exc).__name__}: {exc}",
                            error_class="internal")
